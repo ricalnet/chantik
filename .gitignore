@@ -1,0 +1,6 @@
+backup.conf
+encryption.key
+*.lock
+*.log
+*.tmp
+.backup_state
