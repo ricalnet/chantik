@@ -201,7 +201,10 @@ log_verbose() {
 error_exit() {
     local msg="$*"
     log "ERROR: $msg"
-    send_ntfy "🔴 BACKUP FAILED\n━━━━━━━━━━━━━━━━━━━━━━━━\n❌ Error: $msg\n⏱️ Time: $(date '+%Y-%m-%d %H:%M:%S')" "error"
+    
+    local error_msg="❌ Error: $msg\n⏱️ Time: $(date '+%Y-%m-%d %H:%M:%S')\n📝 Log: $LOG_FILE"
+    
+    send_ntfy "$error_msg" "error"
     cleanup_temp
     exit 1
 }
@@ -221,11 +224,32 @@ send_ntfy() {
     
     local priority="3"
     local tags="information_source"
+    local title=""
+    
     case "$status" in
-        error)   priority="5"; tags="red_circle" ;;
-        success) priority="3"; tags="white_check_mark" ;;
-        info)    priority="3"; tags="information_source" ;;
+        error)   
+            priority="5"
+            tags="red_circle"
+            title="❌ BACKUP FAILED"
+            ;;
+        success) 
+            priority="3"
+            tags="white_check_mark"
+            title="✅ BACKUP SUCCESS"
+            ;;
+        info)    
+            priority="3"
+            tags="information_source"
+            title="ℹ️ BACKUP INFO"
+            ;;
+        restore)
+            priority="3"
+            tags="arrows_counterclockwise"
+            title="🔄 RESTORE COMPLETED"
+            ;;
     esac
+    
+    local clean_message=$(echo -e "$message" | sed 's/\*\*//g')
     
     {
         local servers=(
@@ -251,10 +275,10 @@ send_ntfy() {
                 --max-time 10 \
                 --connect-timeout 5 \
                 -H "Authorization: Bearer $NTFY_TOKEN" \
-                -H "Title: 🔔 Backup Notification" \
+                -H "Title: $title" \
                 -H "Priority: $priority" \
                 -H "Tags: $tags" \
-                -d "$message" \
+                --data-binary "$clean_message" \
                 "$server/$NTFY_TOPIC" 2>/dev/null)
             
             if [[ "$http_code" == "200" ]]; then
@@ -590,8 +614,9 @@ backup_directory() {
         tar -cf "$tar_file" -C "$(dirname "$src")" "${exclude_opts[@]}" "$(basename "$src")" \
         --preserve-permissions --same-owner
 
-    log "Compressing $tar_file with gzip level $GZIP_LEVEL"
-    gzip -v -$GZIP_LEVEL "$tar_file"
+    log "🗜️ Compressing with gzip level $GZIP_LEVEL..."
+    gzip -$GZIP_LEVEL "$tar_file" 2>/dev/null || error_exit "Compression failed for $tar_file"
+    log "✅ Compression complete"
     if [[ ! -f "$gz_file" ]]; then
         error_exit "Compression failed for $tar_file"
     fi
@@ -613,7 +638,7 @@ backup_docker_volume() {
     local gz_file="${tar_file}.gz"
     local enc_file="${gz_file}.enc"
 
-    log "Backing up Docker volume: $volume"
+    log "📦 Backing up Docker volume: $volume"
     if ! docker volume inspect "$volume" &>/dev/null; then
         error_exit "Docker volume $volume does not exist"
     fi
@@ -648,8 +673,8 @@ backup_docker_volume() {
         error_exit "Tar file is corrupted or empty: $tar_file"
     fi
 
-    log "Compressing $tar_file (gzip level $GZIP_LEVEL)"
-    gzip -v -$GZIP_LEVEL "$tar_file"
+    log "🗜️ Compressing with gzip level $GZIP_LEVEL..."
+    gzip -$GZIP_LEVEL "$tar_file" 2>/dev/null || error_exit "Compression failed for $tar_file"
     if [[ ! -f "$gz_file" ]] || [[ ! -s "$gz_file" ]]; then
         error_exit "Compression failed for $tar_file"
     fi
@@ -985,6 +1010,53 @@ verify_all_backups() {
     return $failed
 }
 
+deduplicate_backups() {
+    local backup_dir="$1"
+    
+    if [[ -z "$DEDUP_TOOL" ]]; then
+        log_verbose "Deduplication disabled (DEDUP_TOOL not set)"
+        return 0
+    fi
+    
+    if ! command -v "$DEDUP_TOOL" &> /dev/null; then
+        log "⚠️ WARNING: Deduplication tool '$DEDUP_TOOL' not found. Skipping dedup."
+        return 0
+    fi
+    
+    log "🔗 Running deduplication on $backup_dir using $DEDUP_TOOL..."
+    
+    local start_time=$(date +%s)
+    
+    case "$DEDUP_TOOL" in
+        hardlink)
+            if hardlink "$backup_dir" >/dev/null 2>&1; then
+                local total_files=$(find "$backup_dir" -name "*.enc" -type f 2>/dev/null | wc -l)
+                local duration=$(( $(date +%s) - start_time ))
+                log "✅ Deduplication complete: $total_files .enc files processed (${duration}s)"
+                return 0
+            else
+                log "⚠️ WARNING: hardlink deduplication failed"
+                return 1
+            fi
+            ;;
+        jdupes)
+            if jdupes -L -r "$backup_dir" >/dev/null 2>&1; then
+                local total_files=$(find "$backup_dir" -name "*.enc" -type f 2>/dev/null | wc -l)
+                local duration=$(( $(date +%s) - start_time ))
+                log "✅ Deduplication complete: $total_files .enc files processed (${duration}s)"
+                return 0
+            else
+                log "⚠️ WARNING: jdupes deduplication failed"
+                return 1
+            fi
+            ;;
+        *)
+            log "⚠️ WARNING: Unknown deduplication tool '$DEDUP_TOOL'. Supported: hardlink, jdupes"
+            return 1
+            ;;
+    esac
+}
+
 restore_from_backup() {
     local enc_file="$1"
     if [[ ! -f "$enc_file" ]]; then
@@ -1003,7 +1075,7 @@ restore_from_backup() {
         type=$(echo "$basename" | sed -E 's/\.tar\.gz\.enc$//')
     fi
     
-    log "Restoring type: $type"
+    log "🔄 Restoring type: $type"
 
     local tmp_dir
     tmp_dir=$(mktemp -d -p "$TMP_DIR" restore_XXXXXX)
@@ -1011,7 +1083,7 @@ restore_from_backup() {
     trap 'rm -rf "$tmp_dir" 2>/dev/null || true; cleanup_temp; exit' INT TERM EXIT
     
     local decrypted_file="${tmp_dir}/$(basename "${enc_file%.enc}")"
-    log "Decrypting $(basename "$enc_file") to $(basename "$decrypted_file")"
+    log "🔐 Decrypting $(basename "$enc_file")..."
     decrypt_file "$enc_file" "$decrypted_file"
 
     if [[ ! -f "$decrypted_file" ]]; then
@@ -1020,7 +1092,7 @@ restore_from_backup() {
 
     local checksum_file="${enc_file%.enc}.checksums"
     if [[ -f "$checksum_file" ]]; then
-        log "Verifying checksum of decrypted file..."
+        log "🔍 Verifying checksum..."
         local sha_original
         sha_original=$(grep '^SHA256:' "$checksum_file" | awk '{print $2}')
         local sha_current
@@ -1034,7 +1106,7 @@ restore_from_backup() {
         log "⚠️ WARNING: No checksum file found; skipping verification."
     fi
 
-    log "Decompressing $(basename "$decrypted_file")"
+    log "📦 Decompressing $(basename "$decrypted_file")..."
     gzip -d "$decrypted_file" 2>/dev/null || error_exit "Gunzip failed"
     local tar_file="${decrypted_file%.gz}"
     if [[ ! -f "$tar_file" ]]; then
@@ -1045,7 +1117,7 @@ restore_from_backup() {
         local dest_dir="$SOURCE_DIR"
         dest_dir="${dest_dir%/}"
         
-        log "Restoring directory backup to $dest_dir"
+        log "📁 Restoring directory backup to $dest_dir"
         
         local use_sudo=false
         if [[ ! -w "$(dirname "$dest_dir")" ]] || [[ ! -w "$dest_dir" && -d "$dest_dir" ]]; then
@@ -1067,7 +1139,7 @@ restore_from_backup() {
             error_exit "Tar file appears to be empty or corrupted"
         fi
         
-        log "First entry in tar: $first_entry"
+        log_verbose "First entry in tar: $first_entry"
         
         local top_dir=$(echo "$first_entry" | cut -d'/' -f1)
         
@@ -1078,14 +1150,14 @@ restore_from_backup() {
         fi
         
         if [[ "$all_under_top" == "true" ]] && [[ -n "$top_dir" ]]; then
-            log "Tar contains all files under top-level directory: $top_dir"
+            log "📋 Tar contains all files under top-level directory: $top_dir"
             
             local extract_dir="${tmp_dir}/extract"
             mkdir -p "$extract_dir"
             tar -xf "$tar_file" -C "$extract_dir" --preserve-permissions --same-owner
             
             if [[ -d "$extract_dir/$top_dir" ]]; then
-                log "Moving contents from $top_dir to $dest_dir"
+                log "📋 Moving contents from $top_dir to $dest_dir"
                 
                 if [[ "$use_sudo" == "true" ]]; then
                     if command -v rsync &> /dev/null; then
@@ -1109,7 +1181,7 @@ restore_from_backup() {
                 
                 rm -rf "$extract_dir"
             else
-                log "Fallback: Extracting directly to $dest_dir"
+                log "📋 Fallback: Extracting directly to $dest_dir"
                 if [[ "$use_sudo" == "true" ]]; then
                     sudo tar -xf "$tar_file" -C "$dest_dir" --preserve-permissions --same-owner
                 else
@@ -1118,7 +1190,7 @@ restore_from_backup() {
                 log "✅ Directory restore completed to $dest_dir"
             fi
         else
-            log "Tar contains multiple top-level items or flat structure"
+            log "📋 Tar contains multiple top-level items or flat structure"
             
             if [[ "$use_sudo" == "true" ]]; then
                 sudo tar -xf "$tar_file" -C "$dest_dir" --preserve-permissions --same-owner
@@ -1138,10 +1210,10 @@ restore_from_backup() {
         
     elif [[ "$type" =~ ^volume_ ]]; then
         local volume_name="${type#volume_}"
-        log "Restoring Docker volume: $volume_name"
+        log "📦 Restoring Docker volume: $volume_name"
         
         if ! docker volume inspect "$volume_name" &>/dev/null; then
-            log "Volume $volume_name does not exist; creating it."
+            log "📂 Volume $volume_name does not exist; creating it."
             docker volume create "$volume_name" || error_exit "Failed to create volume $volume_name"
         fi
         
@@ -1156,7 +1228,7 @@ restore_from_backup() {
         local container_name="restore_vol_${volume_name}_$(date +%s)_$$"
         
         if [[ -d "$extract_dir/$vol_first_entry" ]] && [[ $(ls -A "$extract_dir" 2>/dev/null | wc -l) -eq 1 ]]; then
-            log "Volume data is under single directory: $vol_first_entry"
+            log "📋 Volume data is under single directory: $vol_first_entry"
             
             docker run -d --name "$container_name" \
                 -v "$volume_name":/volume \
@@ -1182,7 +1254,7 @@ restore_from_backup() {
             
             log "✅ Volume restore completed for $volume_name"
         else
-            log "Multiple top-level items found, copying all..."
+            log "📋 Multiple top-level items found, copying all..."
             
             docker run -d --name "$container_name" \
                 -v "$volume_name":/volume \
@@ -1215,9 +1287,16 @@ restore_from_backup() {
 
     rm -rf "$tmp_dir" 2>/dev/null || true
     trap - INT TERM EXIT
+    
+    local restore_msg="📁 File: $(basename "$enc_file")\n"
+    restore_msg+="📂 Type: $type\n"
+    restore_msg+="⏱️ Time: $(date '+%Y-%m-%d %H:%M:%S')\n"
+    restore_msg+="✅ Status: Restore completed successfully"
+    
+    send_ntfy "$restore_msg" "restore"
+    
     log "✅ Restore completed successfully."
 }
-
 list_backups() {
     local backup_dir="$1"
     echo ""
@@ -1249,16 +1328,19 @@ list_backups() {
     echo ""
 }
 
+log_section() {
+    log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log "$1"
+    log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
 do_backup() {
     BACKUP_START_TIME=$(date +%s)
     local start_date=$(date '+%Y-%m-%d %H:%M:%S')
     
-    log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    log "🚀 Starting backup (v$VERSION)"
-    log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log_section "🚀 Starting backup (v$VERSION)"
     
     load_config
-    
     init_tmp
     
     local hostname=$(hostname)
@@ -1285,21 +1367,7 @@ do_backup() {
     log "🗜️ Compression: gzip level $GZIP_LEVEL"
     log "📋 Retention: Daily=${RETENTION_DAILY}, Weekly=${RETENTION_WEEKLY}, Monthly=${RETENTION_MONTHLY}"
     
-    send_ntfy "🚀 BACKUP STARTED
-━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📅 Time: $start_date
-💻 Host: $hostname
-📁 Source: $SOURCE_DIR
-📊 Size: $source_size_human ($source_files files)
-🐳 Volumes: $volume_count volumes
-💾 Target: $BACKUP_BASE_DIR
-💿 Free space: $free_space_human
-🔒 Encryption: AES-256-CBC
-🔑 PBKDF2: ${PBKDF2_ITERATIONS:-600000} iterations
-🔗 Deduplication: $([ -n "$FIXED_SALT_FILE" ] && echo "ENABLED" || echo "DISABLED")
-🗜️ Compression: gzip level $GZIP_LEVEL
-📋 Retention: Daily=${RETENTION_DAILY}, Weekly=${RETENTION_WEEKLY}, Monthly=${RETENTION_MONTHLY}" "info"
-    
+    send_ntfy "📅 Time: $start_date\n💻 Host: $hostname\n📁 Source: $SOURCE_DIR\n📊 Size: $source_size_human ($source_files files)\n🐳 Volumes: $volume_count volumes\n💾 Target: $BACKUP_BASE_DIR\n💿 Free space: $free_space_human\n🔒 Encryption: AES-256-CBC\n🔑 PBKDF2: ${PBKDF2_ITERATIONS:-600000} iterations\n🔗 Dedup: $([ -n "$FIXED_SALT_FILE" ] && echo "ENABLED" || echo "DISABLED")\n🗜️ Compression: gzip level $GZIP_LEVEL\n📋 Retention: Daily=${RETENTION_DAILY}, Weekly=${RETENTION_WEEKLY}, Monthly=${RETENTION_MONTHLY}" "info"
     acquire_lock
     check_docker
     check_disk_space "$BACKUP_BASE_DIR" 1024
@@ -1357,30 +1425,14 @@ do_backup() {
     local space_used_mb=$((free_space_mb - new_free_space_mb))
     local space_used_human=$(human_size $((space_used_mb * 1024 * 1024)))
 
-    log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    log "✅ Backup completed successfully"
-    log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log_section "✅ Backup completed successfully"
     log "⏱️ Duration: $duration_human"
     log "📦 Archives: $backup_count encrypted files"
     log "💾 Total size: $total_backup_size_human"
     log "📍 Location: $backup_dir"
     log "📝 Log: $LOG_FILE"
 
-    send_ntfy "✅ BACKUP COMPLETED SUCCESSFULLY
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📅 Completed: $end_date
-⏱️ Duration: $duration_human
-📦 Archives: $backup_count encrypted files
-💾 Total size: $total_backup_size_human
-📁 Source size: $source_size_human ($source_files files)
-🐳 Volumes: $volume_count volumes
-💿 Free space: $free_space_human → $(human_size $((new_free_space_mb * 1024 * 1024))) (used $space_used_human)
-🔒 Verification: ✅ All checksums verified
-🗑️ Retention: Daily=${RETENTION_DAILY}, Weekly=${RETENTION_WEEKLY}, Monthly=${RETENTION_MONTHLY}
-🔗 Deduplication: $([ -n "$FIXED_SALT_FILE" ] && echo "ENABLED" || echo "DISABLED")
-📍 Location: $backup_dir
-📝 Log: $LOG_FILE" "success"
-
+    send_ntfy "📅 Completed: $end_date\n⏱️ Duration: $duration_human\n📦 Archives: $backup_count encrypted files\n💾 Total size: $total_backup_size_human\n📁 Source size: $source_size_human ($source_files files)\n🐳 Volumes: $volume_count volumes\n💿 Free space: $free_space_human → $(human_size $((new_free_space_mb * 1024 * 1024))) (used $space_used_human)\n🔒 Verification: ✅ All checksums verified\n🗑️ Retention: Daily=${RETENTION_DAILY}, Weekly=${RETENTION_WEEKLY}, Monthly=${RETENTION_MONTHLY}\n🔗 Deduplication: $([ -n "$FIXED_SALT_FILE" ] && echo "ENABLED" || echo "DISABLED")\n📍 Location: $backup_dir\n📝 Log: $LOG_FILE" "success"
     release_lock
     cleanup_temp
     log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
