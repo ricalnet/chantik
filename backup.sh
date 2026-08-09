@@ -674,65 +674,72 @@ verify_backup() {
         return 1
     fi
     
-    local checksum_file="${enc_file%.enc}.checksums"
     local enc_checksum_file="${enc_file}.enc.checksums"
     
     if [[ -f "$enc_checksum_file" ]]; then
         local stored_sha=$(grep '^SHA256:' "$enc_checksum_file" 2>/dev/null | awk '{print $2}')
         local current_sha=$(sha256sum "$enc_file" 2>/dev/null | awk '{print $1}')
+        
+        log_verbose "Checksum stored:  $stored_sha"
+        log_verbose "Checksum current: $current_sha"
+        
         if [[ "$stored_sha" != "$current_sha" ]]; then
             log "❌ SHA256 MISMATCH for $(basename "$enc_file")"
+            log "   Stored:  $stored_sha"
+            log "   Current: $current_sha"
             return 1
         fi
         log "✅ SHA256 verified for $(basename "$enc_file")"
         return 0
     fi
+
     
-    log_verbose "No encrypted checksum found, using fallback verification for $(basename "$enc_file")"
+    local checksum_file="${enc_file%.enc}.checksums"
     
-    if [[ ! -f "$checksum_file" ]]; then
-        log "⚠️ WARNING: No checksum file found for $(basename "$enc_file")"
+    if [[ -f "$checksum_file" ]]; then
+        log_verbose "No encrypted checksum found, using fallback verification for $(basename "$enc_file")"
         local tmp_dir
         tmp_dir=$(mktemp -d -p "$TMP_DIR" verify_decrypt_XXXXXX 2>/dev/null || 
                   echo "${TMP_DIR}/verify_decrypt_$$_$RANDOM")
         mkdir -p "$tmp_dir" 2>/dev/null
         local decrypted_file="${tmp_dir}/$(basename "${enc_file%.enc}")"
         
-        if decrypt_file "$enc_file" "$decrypted_file" 2>/dev/null; then
-            log "✅ Decryption successful for $(basename "$enc_file") (no checksum available)"
-            rm -rf "$tmp_dir" 2>/dev/null
-            return 0
-        else
+        if ! decrypt_file "$enc_file" "$decrypted_file" 2>/dev/null; then
             log "❌ Decryption failed for $(basename "$enc_file")"
             rm -rf "$tmp_dir" 2>/dev/null
             return 1
         fi
+        
+        local stored_sha=$(grep '^SHA256:' "$checksum_file" 2>/dev/null | awk '{print $2}')
+        local current_sha=$(sha256sum "$decrypted_file" 2>/dev/null | awk '{print $1}')
+        
+        rm -rf "$tmp_dir" 2>/dev/null
+        
+        if [[ "$stored_sha" != "$current_sha" ]]; then
+            log "❌ SHA256 MISMATCH for $(basename "$enc_file")"
+            return 1
+        fi
+        
+        log "✅ SHA256 verified for $(basename "$enc_file")"
+        return 0
     fi
     
+    log "⚠️ WARNING: No checksum file found for $(basename "$enc_file")"
     local tmp_dir
     tmp_dir=$(mktemp -d -p "$TMP_DIR" verify_decrypt_XXXXXX 2>/dev/null || 
               echo "${TMP_DIR}/verify_decrypt_$$_$RANDOM")
     mkdir -p "$tmp_dir" 2>/dev/null
     local decrypted_file="${tmp_dir}/$(basename "${enc_file%.enc}")"
     
-    if ! decrypt_file "$enc_file" "$decrypted_file" 2>/dev/null; then
+    if decrypt_file "$enc_file" "$decrypted_file" 2>/dev/null; then
+        log "✅ Decryption successful for $(basename "$enc_file") (no checksum available)"
+        rm -rf "$tmp_dir" 2>/dev/null
+        return 0
+    else
         log "❌ Decryption failed for $(basename "$enc_file")"
         rm -rf "$tmp_dir" 2>/dev/null
         return 1
     fi
-    
-    local stored_sha=$(grep '^SHA256:' "$checksum_file" 2>/dev/null | awk '{print $2}')
-    local current_sha=$(sha256sum "$decrypted_file" 2>/dev/null | awk '{print $1}')
-    
-    rm -rf "$tmp_dir" 2>/dev/null
-    
-    if [[ "$stored_sha" != "$current_sha" ]]; then
-        log "❌ SHA256 MISMATCH for $(basename "$enc_file")"
-        return 1
-    fi
-    
-    log "✅ SHA256 verified for $(basename "$enc_file")"
-    return 0
 }
 
 get_backup_age_days() {
@@ -873,29 +880,42 @@ verify_backup_integrity() {
     fi
     echo "📦 File size: $(human_size "$file_size")"
     
-    local checksum_file="${enc_file%.enc}.checksums"
-    if [[ ! -f "$checksum_file" ]]; then
-        echo "⚠️  WARNING: Checksum file not found: $(basename "$checksum_file")"
-        echo "   Cannot verify integrity without checksums."
-        result=1
-    else
-        local stored_sha=$(grep '^SHA256:' "$checksum_file" 2>/dev/null | awk '{print $2}')
+    local enc_checksum_file="${enc_file}.enc.checksums"
+    
+    if [[ -f "$enc_checksum_file" ]]; then
+        local stored_sha=$(grep '^SHA256:' "$enc_checksum_file" 2>/dev/null | awk '{print $2}')
+        local current_sha=$(sha256sum "$enc_file" 2>/dev/null | awk '{print $1}')
         
-        if [[ -z "$stored_sha" ]]; then
-            echo "⚠️  WARNING: Invalid checksum file format (missing SHA256)"
-            result=1
+        echo "🔐 Checksum details:"
+        echo "   📝 Stored:  $stored_sha"
+        echo "   🔄 Current: $current_sha"
+        
+        if [[ "$stored_sha" == "$current_sha" ]]; then
+            echo "✅ SHA256: MATCH"
         else
-            echo "🔐 Calculating current SHA256..."
+            echo "❌ SHA256: MISMATCH"
+            result=1
+        fi
+    else
+        local checksum_file="${enc_file%.enc}.checksums"
+        if [[ -f "$checksum_file" ]]; then
+            echo "⚠️  Using fallback checksum (gz file)"
+            local stored_sha=$(grep '^SHA256:' "$checksum_file" 2>/dev/null | awk '{print $2}')
             local current_sha=$(sha256sum "$enc_file" 2>/dev/null | awk '{print $1}')
             
+            echo "🔐 Checksum details (fallback):"
+            echo "   📝 Stored:  $stored_sha"
+            echo "   🔄 Current: $current_sha"
+            
             if [[ "$stored_sha" == "$current_sha" ]]; then
-                echo "✅ SHA256: MATCH"
+                echo "✅ SHA256: MATCH (fallback)"
             else
-                echo "❌ SHA256: MISMATCH"
-                echo "   Stored:  $stored_sha"
-                echo "   Current: $current_sha"
+                echo "❌ SHA256: MISMATCH (fallback)"
                 result=1
             fi
+        else
+            echo "⚠️  WARNING: No checksum file found"
+            result=1
         fi
     fi
     
