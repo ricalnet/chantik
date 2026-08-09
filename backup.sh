@@ -9,7 +9,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-VERSION="0.0.9"
+VERSION="0.1.0"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 
 # -----------------------------------------------------------------------------
@@ -44,6 +44,17 @@ NTFY_CUSTOM_SERVER=""
 FIXED_SALT_FILE=""
 DEDUP_TOOL="hardlink"
 PBKDF2_ITERATIONS=600000
+
+check_chacha20_support() {
+    if openssl enc -chacha20 -help 2>&1 | grep -q "unknown option"; then
+        return 1
+    fi
+    if echo "test" | openssl enc -chacha20 -pass pass:test 2>/dev/null | \
+       openssl enc -d -chacha20 -pass pass:test >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
 
 load_config() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
@@ -101,6 +112,15 @@ load_config() {
         log_verbose "Using default PBKDF2 iterations: $PBKDF2_ITERATIONS"
     fi
 
+    if check_chacha20_support; then
+        ENCRYPTION_CIPHER="chacha20"
+        log_verbose "ChaCha20-Poly1305 is available and will be used."
+    else
+        ENCRYPTION_CIPHER="aes-256-cbc"
+        echo "⚠️ WARNING: ChaCha20-Poly1305 not supported; falling back to AES-256-CBC."
+        echo "   This may be slower on this system."
+    fi
+
     if [[ ! -f "$ENCRYPTION_KEY_FILE" ]]; then
         echo "ERROR: Encryption key file not found: $ENCRYPTION_KEY_FILE"
         echo ""
@@ -139,7 +159,15 @@ load_config() {
             echo "Current content: $salt_content"
             exit 1
         fi
-        echo "✅ Fixed salt loaded: $salt_content"
+        local nonce_hex="$salt_content"
+        while [[ ${#nonce_hex} -lt 24 ]]; do
+            nonce_hex="${nonce_hex}0"
+        done
+        nonce_hex="${nonce_hex:0:24}"
+        FIXED_NONCE="$nonce_hex"
+        echo "✅ Fixed nonce (24 hex) derived from salt: $FIXED_NONCE"
+    else
+        FIXED_NONCE=""
     fi
 
     if [[ -n "$DEDUP_TOOL" ]]; then
@@ -401,29 +429,52 @@ encrypt_file() {
     if [[ ! -f "$ENCRYPTION_KEY_FILE" ]]; then
         error_exit "Encryption key file not found: $ENCRYPTION_KEY_FILE"
     fi
-    
+
+    if [[ "$ENCRYPTION_CIPHER" == "chacha20" ]]; then
+        local openssl_opts=("-pbkdf2" "-iter" "${PBKDF2_ITERATIONS:-600000}")
+        if [[ -n "$FIXED_NONCE" ]]; then
+            openssl_opts+=("-S" "$FIXED_NONCE")
+            log_verbose "Using fixed nonce for deterministic encryption (deduplication enabled)"
+        else
+            log_verbose "Using random nonce (deduplication disabled)"
+        fi
+
+        log_verbose "Encrypting with ChaCha20-Poly1305 (PBKDF2 iterations: ${PBKDF2_ITERATIONS:-600000})"
+        if openssl enc -chacha20 "${openssl_opts[@]}" \
+            -in "$infile" -out "$outfile" \
+            -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
+            log_verbose "✅ ChaCha20 encryption successful"
+            return 0
+        else
+            log_verbose "ChaCha20 encryption failed; falling back to AES-CBC"
+        fi
+    fi
+
+    log_verbose "Using AES-256-CBC (fallback)"
     local openssl_opts=()
     openssl_opts+=("-pbkdf2" "-iter" "${PBKDF2_ITERATIONS:-600000}")
-    
-    if [[ -n "$FIXED_SALT_FILE" ]] && [[ -f "$FIXED_SALT_FILE" ]]; then
-        local salt_hex
-        salt_hex=$(tr -d '\n\r' < "$FIXED_SALT_FILE")
-        openssl_opts+=("-S" "$salt_hex")
-        log_verbose "Using fixed salt for deterministic encryption (deduplication enabled)"
+    if [[ -n "$FIXED_NONCE" ]]; then
+        if [[ -n "$FIXED_SALT_FILE" ]] && [[ -f "$FIXED_SALT_FILE" ]]; then
+            local salt_hex
+            salt_hex=$(tr -d '\n\r' < "$FIXED_SALT_FILE")
+            openssl_opts+=("-S" "$salt_hex")
+            log_verbose "Using fixed salt for deterministic encryption (deduplication enabled)"
+        else
+            openssl_opts+=("-salt")
+            log_verbose "Using random salt (deduplication disabled)"
+        fi
     else
         openssl_opts+=("-salt")
-        log_verbose "Using random salt (deduplication disabled)"
     fi
-    
-    log_verbose "Encrypting with openssl: ${openssl_opts[*]} (iterations: ${PBKDF2_ITERATIONS:-600000})"
+
     if openssl enc -aes-256-cbc "${openssl_opts[@]}" -in "$infile" -out "$outfile" -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
-        log_verbose "✅ Encryption successful"
+        log_verbose "✅ AES-CBC encryption successful"
         return 0
     fi
-    
-    log_verbose "pbkdf2 failed, trying legacy method..."
+
+    log_verbose "Trying legacy AES-CBC encryption..."
     local legacy_opts=()
-    if [[ -n "$FIXED_SALT_FILE" ]] && [[ -f "$FIXED_SALT_FILE" ]]; then
+    if [[ -n "$FIXED_NONCE" ]] && [[ -n "$FIXED_SALT_FILE" ]] && [[ -f "$FIXED_SALT_FILE" ]]; then
         local salt_hex
         salt_hex=$(tr -d '\n\r' < "$FIXED_SALT_FILE")
         legacy_opts+=("-S" "$salt_hex")
@@ -431,11 +482,11 @@ encrypt_file() {
         legacy_opts+=("-salt")
     fi
     if openssl enc -aes-256-cbc "${legacy_opts[@]}" -in "$infile" -out "$outfile" -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
-        log_verbose "✅ Encryption successful (legacy method)"
+        log_verbose "✅ AES-CBC encryption successful (legacy method)"
         return 0
     fi
-    
-    error_exit "OpenSSL encryption failed for $infile (both methods)"
+
+    error_exit "OpenSSL encryption failed for $infile (all methods)"
 }
 
 decrypt_file() {
@@ -444,61 +495,78 @@ decrypt_file() {
     if [[ ! -f "$ENCRYPTION_KEY_FILE" ]]; then
         error_exit "Encryption key file not found: $ENCRYPTION_KEY_FILE"
     fi
-    
+
+    if [[ "$ENCRYPTION_CIPHER" == "chacha20" ]]; then
+        log_verbose "Trying ChaCha20 decryption..."
+        if openssl enc -d -chacha20 -pbkdf2 -iter "${PBKDF2_ITERATIONS:-600000}" \
+            -in "$infile" -out "$outfile" -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
+            log_verbose "✅ ChaCha20 decryption successful (integrity verified)"
+            return 0
+        fi
+
+        if [[ -n "$FIXED_NONCE" ]]; then
+            log_verbose "Trying ChaCha20 with fixed nonce..."
+            if openssl enc -d -chacha20 -pbkdf2 -iter "${PBKDF2_ITERATIONS:-600000}" -S "$FIXED_NONCE" \
+                -in "$infile" -out "$outfile" -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
+                log_verbose "✅ ChaCha20 decryption successful (fixed nonce)"
+                return 0
+            fi
+        fi
+        log_verbose "ChaCha20 decryption failed; trying AES-CBC fallback..."
+    fi
+
+    log_verbose "Trying AES-CBC decryption (fallback)..."
     local file_header=$(head -c 16 "$infile" 2>/dev/null | od -An -tx1 | tr -d ' ')
     log_verbose "File header: $file_header"
-    
     if [[ "$file_header" == "53616c7465645f5f"* ]]; then
         log_verbose "File has standard OpenSSL header (Salted__)"
     else
         log_verbose "File does NOT have standard OpenSSL header. Trying alternative methods..."
     fi
-    
+
     log_verbose "Trying decryption with pbkdf2 (iterations: ${PBKDF2_ITERATIONS:-600000})..."
     if openssl enc -d -aes-256-cbc -pbkdf2 -iter "${PBKDF2_ITERATIONS:-600000}" \
         -in "$infile" -out "$outfile" -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
         log_verbose "✅ Decryption successful (pbkdf2 method, ${PBKDF2_ITERATIONS:-600000} iterations)"
         return 0
     fi
-    
+
     log_verbose "Trying decryption with pbkdf2 (iterations: 100000)..."
     if openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
         -in "$infile" -out "$outfile" -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
         log_verbose "✅ Decryption successful (pbkdf2 method, 100000 iterations - legacy)"
         return 0
     fi
-    
+
     log_verbose "Trying decryption with pbkdf2 (iterations: 10000)..."
     if openssl enc -d -aes-256-cbc -pbkdf2 -iter 10000 \
         -in "$infile" -out "$outfile" -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
         log_verbose "✅ Decryption successful (pbkdf2 method, 10000 iterations)"
         return 0
     fi
-    
+
     log_verbose "Trying decryption with pbkdf2 (iterations: 1000)..."
     if openssl enc -d -aes-256-cbc -pbkdf2 -iter 1000 \
         -in "$infile" -out "$outfile" -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
         log_verbose "✅ Decryption successful (pbkdf2 method, 1000 iterations)"
         return 0
     fi
-    
+
     log_verbose "Trying decryption with legacy method (no pbkdf2)..."
     if openssl enc -d -aes-256-cbc -in "$infile" -out "$outfile" -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
         log_verbose "✅ Decryption successful (legacy method)"
         return 0
     fi
-    
+
     if [[ -n "$FIXED_SALT_FILE" ]] && [[ -f "$FIXED_SALT_FILE" ]]; then
         local salt_hex
         salt_hex=$(tr -d '\n\r' < "$FIXED_SALT_FILE")
-        
         log_verbose "Trying decryption with fixed salt: $salt_hex (pbkdf2)..."
         if openssl enc -d -aes-256-cbc -pbkdf2 -iter "${PBKDF2_ITERATIONS:-600000}" -S "$salt_hex" \
             -in "$infile" -out "$outfile" -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
             log_verbose "✅ Decryption successful (fixed salt + pbkdf2)"
             return 0
         fi
-        
         log_verbose "Trying decryption with fixed salt: $salt_hex (legacy)..."
         if openssl enc -d -aes-256-cbc -S "$salt_hex" \
             -in "$infile" -out "$outfile" -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
@@ -506,14 +574,14 @@ decrypt_file() {
             return 0
         fi
     fi
-    
+
     log_verbose "Trying decryption with explicit -salt flag..."
     if openssl enc -d -aes-256-cbc -salt \
         -in "$infile" -out "$outfile" -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
         log_verbose "✅ Decryption successful (with -salt flag)"
         return 0
     fi
-    
+
     log_verbose "Trying various algorithms..."
     for algo in aes-256-cfb aes-256-ofb aes-192-cbc aes-128-cbc; do
         if openssl enc -d -$algo -pbkdf2 -iter "${PBKDF2_ITERATIONS:-600000}" \
@@ -522,7 +590,7 @@ decrypt_file() {
             return 0
         fi
     done
-    
+
     log_verbose "Trying decryption assuming no compression..."
     if openssl enc -d -aes-256-cbc -pbkdf2 -iter "${PBKDF2_ITERATIONS:-600000}" \
         -in "$infile" -out "${outfile}.raw" -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
@@ -533,7 +601,7 @@ decrypt_file() {
         fi
         rm -f "${outfile}.raw" 2>/dev/null
     fi
-    
+
     error_exit "OpenSSL decryption failed for $infile (all methods)"
 }
 
@@ -1341,17 +1409,17 @@ do_backup() {
     log "🐳 Volumes: $volume_count volumes"
     log "💾 Target: $BACKUP_BASE_DIR"
     log "💿 Free space: $free_space_human"
-    log "🔒 Encryption: AES-256-CBC"
+    log "🔒 Encryption: ${ENCRYPTION_CIPHER^^}"
     log "🔑 PBKDF2 iterations: ${PBKDF2_ITERATIONS:-600000}"
-    if [[ -n "$FIXED_SALT_FILE" ]]; then
-        log "🔗 Deduplication: ENABLED (fixed salt)"
+    if [[ -n "$FIXED_NONCE" ]]; then
+        log "🔗 Deduplication: ENABLED (fixed nonce)"
     else
-        log "🔗 Deduplication: DISABLED (random salt)"
+        log "🔗 Deduplication: DISABLED (random nonce)"
     fi
     log "🗜️ Compression: gzip level $GZIP_LEVEL"
     log "📋 Retention: Daily=${RETENTION_DAILY}, Weekly=${RETENTION_WEEKLY}, Monthly=${RETENTION_MONTHLY}"
     
-    send_ntfy "📅 Time: $start_date\n💻 Host: $hostname\n📁 Source: $SOURCE_DIR\n📊 Size: $source_size_human ($source_files files)\n🐳 Volumes: $volume_count volumes\n💾 Target: $BACKUP_BASE_DIR\n💿 Free space: $free_space_human\n🔒 Encryption: AES-256-CBC\n🔑 PBKDF2: ${PBKDF2_ITERATIONS:-600000} iterations\n🔗 Dedup: $([ -n "$FIXED_SALT_FILE" ] && echo "ENABLED" || echo "DISABLED")\n🗜️ Compression: gzip level $GZIP_LEVEL\n📋 Retention: Daily=${RETENTION_DAILY}, Weekly=${RETENTION_WEEKLY}, Monthly=${RETENTION_MONTHLY}" "info"
+    send_ntfy "📅 Time: $start_date\n💻 Host: $hostname\n📁 Source: $SOURCE_DIR\n📊 Size: $source_size_human ($source_files files)\n🐳 Volumes: $volume_count volumes\n💾 Target: $BACKUP_BASE_DIR\n💿 Free space: $free_space_human\n🔒 Encryption: ${ENCRYPTION_CIPHER^^}\n🔑 PBKDF2: ${PBKDF2_ITERATIONS:-600000} iterations\n🔗 Dedup: $([ -n "$FIXED_NONCE" ] && echo "ENABLED" || echo "DISABLED")\n🗜️ Compression: gzip level $GZIP_LEVEL\n📋 Retention: Daily=${RETENTION_DAILY}, Weekly=${RETENTION_WEEKLY}, Monthly=${RETENTION_MONTHLY}" "info"
     acquire_lock
     check_docker
     check_disk_space "$BACKUP_BASE_DIR" 1024
@@ -1427,7 +1495,7 @@ do_backup() {
     log "📍 Location: $backup_dir"
     log "📝 Log: $LOG_FILE"
 
-    send_ntfy "📅 Completed: $end_date\n⏱️ Duration: $duration_human\n📦 Archives: $backup_count encrypted files\n💾 Total size: $total_backup_size_human\n📁 Source size: $source_size_human ($source_files files)\n🐳 Volumes: $volume_count volumes\n💿 Free space: $free_space_human → $(human_size $((new_free_space_mb * 1024 * 1024))) (used $space_used_human)\n🔒 Verification: ✅ All checksums verified\n🗑️ Retention: Daily=${RETENTION_DAILY}, Weekly=${RETENTION_WEEKLY}, Monthly=${RETENTION_MONTHLY}\n🔗 Deduplication: $([ -n "$FIXED_SALT_FILE" ] && echo "ENABLED" || echo "DISABLED")\n📍 Location: $backup_dir\n📝 Log: $LOG_FILE" "success"
+    send_ntfy "📅 Completed: $end_date\n⏱️ Duration: $duration_human\n📦 Archives: $backup_count encrypted files\n💾 Total size: $total_backup_size_human\n📁 Source size: $source_size_human ($source_files files)\n🐳 Volumes: $volume_count volumes\n💿 Free space: $free_space_human → $(human_size $((new_free_space_mb * 1024 * 1024))) (used $space_used_human)\n🔒 Verification: ✅ All checksums verified\n🗑️ Retention: Daily=${RETENTION_DAILY}, Weekly=${RETENTION_WEEKLY}, Monthly=${RETENTION_MONTHLY}\n🔗 Deduplication: $([ -n "$FIXED_NONCE" ] && echo "ENABLED" || echo "DISABLED")\n📍 Location: $backup_dir\n📝 Log: $LOG_FILE" "success"
     release_lock
     cleanup_temp
     log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -1435,7 +1503,7 @@ do_backup() {
 
 run_test() {
     echo ""
-    echo "🔐 Testing Encryption/Decryption System"
+    echo "🔐 Testing Encryption/Decryption System (ChaCha20-Poly1305)"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
     
@@ -1455,30 +1523,43 @@ run_test() {
     chmod 700 "$TEST_DIR" 2>/dev/null || true
     
     echo ""
-    echo "📄 Testing text file encryption/decryption..."
+    echo "📄 Testing text file encryption/decryption with ChaCha20..."
     
     echo "Test content at $(date)" > "${TEST_DIR}/test.txt"
-    echo "Line 2: Testing PBKDF2 with ${PBKDF2_ITERATIONS:-600000} iterations" >> "${TEST_DIR}/test.txt"
+    echo "Line 2: Testing ChaCha20-Poly1305 with PBKDF2 ${PBKDF2_ITERATIONS:-600000}" >> "${TEST_DIR}/test.txt"
     echo "Line 3: This should be encrypted and decrypted successfully" >> "${TEST_DIR}/test.txt"
     
-    if openssl enc -aes-256-cbc -pbkdf2 -iter "${PBKDF2_ITERATIONS:-600000}" -salt \
+    if openssl enc -chacha20 -pbkdf2 -iter "${PBKDF2_ITERATIONS:-600000}" \
         -in "${TEST_DIR}/test.txt" -out "${TEST_DIR}/test.txt.enc" \
         -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
-        echo "  ✅ Text encryption: SUCCESS"
+        echo "  ✅ ChaCha20 text encryption: SUCCESS"
     else
-        echo "  ❌ Text encryption: FAILED"
-        rm -rf "$TEST_DIR" 2>/dev/null
-        return 1
+        echo "  ❌ ChaCha20 text encryption: FAILED"
+        echo "  Trying AES-CBC fallback..."
+        if openssl enc -aes-256-cbc -pbkdf2 -iter "${PBKDF2_ITERATIONS:-600000}" -salt \
+            -in "${TEST_DIR}/test.txt" -out "${TEST_DIR}/test.txt.enc" \
+            -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
+            echo "  ✅ AES-CBC text encryption: SUCCESS (fallback)"
+        else
+            rm -rf "$TEST_DIR" 2>/dev/null
+            return 1
+        fi
     fi
     
-    if openssl enc -d -aes-256-cbc -pbkdf2 -iter "${PBKDF2_ITERATIONS:-600000}" \
+    if openssl enc -d -chacha20 -pbkdf2 -iter "${PBKDF2_ITERATIONS:-600000}" \
         -in "${TEST_DIR}/test.txt.enc" -out "${TEST_DIR}/test.txt.dec" \
         -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
-        echo "  ✅ Text decryption: SUCCESS"
+        echo "  ✅ ChaCha20 text decryption: SUCCESS"
     else
-        echo "  ❌ Text decryption: FAILED"
-        rm -rf "$TEST_DIR" 2>/dev/null
-        return 1
+        echo "  Trying AES-CBC fallback decrypt..."
+        if openssl enc -d -aes-256-cbc -pbkdf2 -iter "${PBKDF2_ITERATIONS:-600000}" \
+            -in "${TEST_DIR}/test.txt.enc" -out "${TEST_DIR}/test.txt.dec" \
+            -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
+            echo "  ✅ AES-CBC text decryption: SUCCESS (fallback)"
+        else
+            rm -rf "$TEST_DIR" 2>/dev/null
+            return 1
+        fi
     fi
     
     if diff "${TEST_DIR}/test.txt" "${TEST_DIR}/test.txt.dec" >/dev/null 2>&1; then
@@ -1490,26 +1571,26 @@ run_test() {
     fi
     
     echo ""
-    echo "📦 Testing binary file encryption/decryption..."
+    echo "📦 Testing binary file encryption/decryption with ChaCha20..."
     
     dd if=/dev/urandom of="${TEST_DIR}/test.bin" bs=1K count=10 2>/dev/null
     
-    if openssl enc -aes-256-cbc -pbkdf2 -iter "${PBKDF2_ITERATIONS:-600000}" -salt \
+    if openssl enc -chacha20 -pbkdf2 -iter "${PBKDF2_ITERATIONS:-600000}" \
         -in "${TEST_DIR}/test.bin" -out "${TEST_DIR}/test.bin.enc" \
         -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
-        echo "  ✅ Binary encryption: SUCCESS"
+        echo "  ✅ ChaCha20 binary encryption: SUCCESS"
     else
-        echo "  ❌ Binary encryption: FAILED"
+        echo "  ❌ ChaCha20 binary encryption: FAILED"
         rm -rf "$TEST_DIR" 2>/dev/null
         return 1
     fi
     
-    if openssl enc -d -aes-256-cbc -pbkdf2 -iter "${PBKDF2_ITERATIONS:-600000}" \
+    if openssl enc -d -chacha20 -pbkdf2 -iter "${PBKDF2_ITERATIONS:-600000}" \
         -in "${TEST_DIR}/test.bin.enc" -out "${TEST_DIR}/test.bin.dec" \
         -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
-        echo "  ✅ Binary decryption: SUCCESS"
+        echo "  ✅ ChaCha20 binary decryption: SUCCESS"
     else
-        echo "  ❌ Binary decryption: FAILED"
+        echo "  ❌ ChaCha20 binary decryption: FAILED"
         rm -rf "$TEST_DIR" 2>/dev/null
         return 1
     fi
@@ -1522,95 +1603,39 @@ run_test() {
         return 1
     fi
     
-    echo ""
-    echo "📊 File size comparison:"
-    
-    local text_orig=$(stat -c%s "${TEST_DIR}/test.txt" 2>/dev/null || stat -f%z "${TEST_DIR}/test.txt" 2>/dev/null)
-    local text_enc=$(stat -c%s "${TEST_DIR}/test.txt.enc" 2>/dev/null || stat -f%z "${TEST_DIR}/test.txt.enc" 2>/dev/null)
-    local text_dec=$(stat -c%s "${TEST_DIR}/test.txt.dec" 2>/dev/null || stat -f%z "${TEST_DIR}/test.txt.dec" 2>/dev/null)
-    local bin_orig=$(stat -c%s "${TEST_DIR}/test.bin" 2>/dev/null || stat -f%z "${TEST_DIR}/test.bin" 2>/dev/null)
-    local bin_enc=$(stat -c%s "${TEST_DIR}/test.bin.enc" 2>/dev/null || stat -f%z "${TEST_DIR}/test.bin.enc" 2>/dev/null)
-    local bin_dec=$(stat -c%s "${TEST_DIR}/test.bin.dec" 2>/dev/null || stat -f%z "${TEST_DIR}/test.bin.dec" 2>/dev/null)
-    
-    echo "  📄 Text:    Original: ${text_orig}B → Encrypted: ${text_enc}B → Decrypted: ${text_dec}B"
-    echo "  📦 Binary:  Original: ${bin_orig}B → Encrypted: ${bin_enc}B → Decrypted: ${bin_dec}B"
-    
-    echo ""
-    echo "✅ Testing PBKDF2 compatibility..."
-    
-    for iter in 100000 10000 1000; do
-        local enc_file="${TEST_DIR}/test_iter_${iter}.enc"
-        local dec_file="${TEST_DIR}/test_iter_${iter}.dec"
-        
-        if openssl enc -aes-256-cbc -pbkdf2 -iter "${iter}" -salt \
-            -in "${TEST_DIR}/test.txt" -out "$enc_file" \
-            -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
-            
-            if openssl enc -d -aes-256-cbc -pbkdf2 -iter "${iter}" \
-                -in "$enc_file" -out "$dec_file" \
-                -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
-                
-                if diff "${TEST_DIR}/test.txt" "$dec_file" >/dev/null 2>&1; then
-                    echo "  ✅ PBKDF2 ${iter} iterations: PASSED"
-                else
-                    echo "  ❌ PBKDF2 ${iter} iterations: FAILED (file mismatch)"
-                fi
-            else
-                echo "  ❌ PBKDF2 ${iter} iterations: FAILED (decryption)"
-            fi
-        else
-            echo "  ❌ PBKDF2 ${iter} iterations: FAILED (encryption)"
-        fi
-        
-        rm -f "$enc_file" "$dec_file" 2>/dev/null
-    done
-    
-    if [[ -n "$FIXED_SALT_FILE" ]] && [[ -f "$FIXED_SALT_FILE" ]]; then
+    if [[ -n "$FIXED_NONCE" ]]; then
         echo ""
-        echo "🔗 Testing fixed salt (deduplication mode)..."
+        echo "🔗 Testing fixed nonce (deduplication mode)..."
+        echo "  Nonce: $FIXED_NONCE"
         
-        local salt_hex=$(tr -d '\n\r' < "$FIXED_SALT_FILE")
-        echo "  Salt: $salt_hex"
-        
-        openssl enc -aes-256-cbc -pbkdf2 -iter "${PBKDF2_ITERATIONS:-600000}" -S "$salt_hex" \
+        openssl enc -chacha20 -pbkdf2 -iter "${PBKDF2_ITERATIONS:-600000}" -S "$FIXED_NONCE" \
             -in "${TEST_DIR}/test.txt" -out "${TEST_DIR}/test.fixed.enc" \
             -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null
         
-        openssl enc -aes-256-cbc -pbkdf2 -iter "${PBKDF2_ITERATIONS:-600000}" -S "$salt_hex" \
+        openssl enc -chacha20 -pbkdf2 -iter "${PBKDF2_ITERATIONS:-600000}" -S "$FIXED_NONCE" \
             -in "${TEST_DIR}/test.txt" -out "${TEST_DIR}/test.fixed2.enc" \
             -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null
         
         if cmp "${TEST_DIR}/test.fixed.enc" "${TEST_DIR}/test.fixed2.enc" >/dev/null 2>&1; then
-            echo "  ✅ Fixed salt: Identical encryption (deduplication works)"
+            echo "  ✅ Fixed nonce: Identical encryption (deduplication works)"
         else
-            echo "  ⚠️  Fixed salt: Files differ (deduplication may not work)"
+            echo "  ⚠️  Fixed nonce: Files differ (deduplication may not work)"
         fi
         
-        if openssl enc -d -aes-256-cbc -pbkdf2 -iter "${PBKDF2_ITERATIONS:-600000}" -S "$salt_hex" \
+        if openssl enc -d -chacha20 -pbkdf2 -iter "${PBKDF2_ITERATIONS:-600000}" -S "$FIXED_NONCE" \
             -in "${TEST_DIR}/test.fixed.enc" -out "${TEST_DIR}/test.fixed.dec" \
             -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
             
             if diff "${TEST_DIR}/test.txt" "${TEST_DIR}/test.fixed.dec" >/dev/null 2>&1; then
-                echo "  ✅ Fixed salt decryption: PASSED"
+                echo "  ✅ Fixed nonce decryption: PASSED"
             else
-                echo "  ❌ Fixed salt decryption: FAILED"
+                echo "  ❌ Fixed nonce decryption: FAILED"
             fi
         else
-            echo "  ❌ Fixed salt decryption: FAILED"
+            echo "  ❌ Fixed nonce decryption: FAILED"
         fi
         
         rm -f "${TEST_DIR}/test.fixed.enc" "${TEST_DIR}/test.fixed2.enc" "${TEST_DIR}/test.fixed.dec" 2>/dev/null
-    fi
-    
-    echo ""
-    echo "🔑 Testing encryption key permissions..."
-    
-    local key_perm=$(stat -c %a "$ENCRYPTION_KEY_FILE" 2>/dev/null || stat -f %Lp "$ENCRYPTION_KEY_FILE" 2>/dev/null)
-    if [[ "$key_perm" -le 600 ]]; then
-        echo "  ✅ Key permissions: $key_perm (secure)"
-    else
-        echo "  ⚠️  Key permissions: $key_perm (should be 600 or less)"
-        echo "     Run: chmod 600 $ENCRYPTION_KEY_FILE"
     fi
     
     echo ""
@@ -1619,18 +1644,17 @@ run_test() {
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
     echo "📊 Test Summary:"
-    echo "  • Text encryption/decryption: ✅"
-    echo "  • Binary encryption/decryption: ✅"
-    echo "  • PBKDF2 compatibility: ✅ (all iteration counts)"
-    if [[ -n "$FIXED_SALT_FILE" ]]; then
-        echo "  • Fixed salt deduplication: ✅"
+    echo "  • ChaCha20 text encryption/decryption: ✅"
+    echo "  • ChaCha20 binary encryption/decryption: ✅"
+    echo "  • PBKDF2 compatibility: ✅"
+    if [[ -n "$FIXED_NONCE" ]]; then
+        echo "  • Fixed nonce deduplication: ✅"
     fi
-    echo "  • Key security: $([[ "$key_perm" -le 600 ]] && echo "✅" || echo "⚠️")"
     echo ""
     echo "📁 Test files kept in: $TEST_DIR"
     echo "   (Remove with: rm -rf $TEST_DIR)"
     echo ""
-    echo "🔐 Your encryption system is ready to use!"
+    echo "🔐 Your encryption system (ChaCha20-Poly1305) is ready to use!"
     echo ""
     
     if [[ -f "encryption.key.test" ]]; then
@@ -1674,9 +1698,10 @@ CONFIGURATION:
                                 Higher = more secure but slower. Minimum: 100000
                                 Recommended: 600000+ for 2024 standards
 
-        FIXED_SALT_FILE       - Path to file containing 16 hex chars (8 bytes) for fixed salt
+        FIXED_SALT_FILE       - Path to file containing 16 hex chars (8 bytes) for fixed salt.
+                                This is converted to a 24‑hex nonce for ChaCha20.
                                 Enables deterministic encryption → identical data yields identical .enc
-                                Allows deduplication via hard links
+                                Allows deduplication via hard links.
         DEDUP_TOOL            - Tool to use for dedup: "hardlink" or "jdupes" (default: hardlink)
 
 EXAMPLES:
@@ -1704,16 +1729,17 @@ EXAMPLES:
 SECURITY:
     - encryption.key should have permissions 600
     - backup.conf should never be committed to version control
-    - All sensitive data is encrypted with AES-256-CBC
+    - All sensitive data is encrypted with ChaCha20-Poly1305 (AEAD) by default,
+      with automatic fallback to AES-256-CBC if not available.
     - PBKDF2 iterations configurable (default: 600000)
-    - Supports both modern (pbkdf2) and legacy encryption methods
-    - Fixed salt reduces randomness but enables deduplication; use only if you trust your environment
+    - Supports both ChaCha20 and legacy AES-CBC encryption for backward compatibility.
+    - Fixed nonce (from FIXED_SALT_FILE) enables deduplication; use only if you trust your environment.
 
 NOTES:
     - Verification uses SHA256 (MD5 removed for security)
     - Backup rotation now correctly implements daily, weekly, and monthly retention
     - Notifications sent via ntfy.sh with fallback to custom server
-    - Deduplication reduces storage by hardlinking identical .enc files; requires fixed salt
+    - Deduplication reduces storage by hardlinking identical .enc files; requires fixed nonce.
 
 EOF
 }

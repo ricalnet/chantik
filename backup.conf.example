@@ -34,17 +34,34 @@ NTFY_TOKEN="your-ntfy-token"
 ENCRYPTION_KEY_FILE="/path/to/encryption.key"
 # Generate: openssl rand -base64 32 > encryption.key && chmod 600 encryption.key
 
-# PBKDF2 iterations for key derivation (higher = more secure but slower)
-# Recommended: 600000+ for 2024 security standards
+# =============================================================================
+# ENCRYPTION CIPHER - Select your preferred cipher
+# =============================================================================
+# The script will auto-detect available ciphers, but you can force a specific one.
+# Options:
+#   "auto"       - Auto-detect: ChaCha20 if available, else AES-256-CBC (default)
+#   "chacha20"   - Force ChaCha20-Poly1305 (recommended for Raspberry Pi / ARM)
+#   "aes-256-cbc" - Force AES-256-CBC (compatibility mode)
+#
+ENCRYPTION_CIPHER="auto"
+
+# -----------------------------------------------------------------------------
+# PBKDF2 ITERATIONS
+# -----------------------------------------------------------------------------
+# Higher = more secure but slower. Minimum: 100000
+# Recommended: 600000+
 # Default: 600000
-# PBKDF2_ITERATIONS=600000
+PBKDF2_ITERATIONS=600000
 
 # -----------------------------------------------------------------------------
 # DEDUPLICATION - Optional
 # -----------------------------------------------------------------------------
-# To enable deduplication, set a fixed salt file and choose a dedup tool.
-# Fixed salt makes encryption deterministic: identical source data produces
+# To enable deduplication, set a fixed nonce/salt file.
+# This makes encryption deterministic: identical source data produces
 # identical encrypted files, so hard links can replace duplicates.
+#
+# For ChaCha20: the salt is converted to a 24-hex nonce (12 bytes)
+# For AES-CBC: uses 16-hex salt (8 bytes) directly
 #
 # Generate fixed salt (16 hex chars = 8 bytes):
 #   openssl rand -hex 8 > fixed_salt.txt
