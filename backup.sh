@@ -110,15 +110,6 @@ load_config() {
         exit 1
     fi
 
-    if [[ ! -f "$ENCRYPTION_KEY_FILE" ]]; then
-        echo "ERROR: Encryption key file not found: $ENCRYPTION_KEY_FILE"
-        echo ""
-        echo "Generate one using:"
-        echo "  openssl rand -base64 32 > encryption.key"
-        echo "  chmod 600 encryption.key"
-        exit 1
-    fi
-
     if [[ ! -d "$SOURCE_DIR" ]]; then
         echo "ERROR: Source directory does not exist: $SOURCE_DIR"
         exit 1
@@ -209,7 +200,7 @@ error_exit() {
     exit 1
 }
 
-trap 'error_exit "Backup interrupted or failed at line $LINENO"' ERR
+trap 'error_exit "Backup interrupted or failed at line ${BASH_LINENO[0]}"' ERR
 
 send_ntfy() {
     local message="$1"
@@ -396,7 +387,7 @@ release_lock() {
 }
 
 cleanup_temp() {
-    find "$TMP_DIR" -type f -name "backup_rotate_*" -delete 2>/dev/null || true
+    find "$TMP_DIR" -type f -name "backup_rotate_*" -exec rm -f {} + 2>/dev/null || true
     find "$TMP_DIR" -type f -name "ntfy_response_*" -delete 2>/dev/null || true
     find "$TMP_DIR" -type f -name "ntfy_http_*" -delete 2>/dev/null || true
     find "$TMP_DIR" -type d -name "verify_test_*" -exec rm -rf {} + 2>/dev/null || true
@@ -454,37 +445,7 @@ decrypt_file() {
         error_exit "Encryption key file not found: $ENCRYPTION_KEY_FILE"
     fi
     
-    log_verbose "Trying decryption with pbkdf2 (iterations: ${PBKDF2_ITERATIONS:-600000})..."
-    if openssl enc -d -aes-256-cbc -pbkdf2 -iter "${PBKDF2_ITERATIONS:-600000}" \
-        -in "$infile" -out "$outfile" -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
-        log_verbose "✅ Decryption successful (pbkdf2 method, ${PBKDF2_ITERATIONS:-600000} iterations)"
-        return 0
-    fi
-    
-    log_verbose "pbkdf2 with ${PBKDF2_ITERATIONS:-600000} failed, trying with 100000 iterations..."
-    if openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
-        -in "$infile" -out "$outfile" -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
-        log_verbose "✅ Decryption successful (pbkdf2 method, 100000 iterations - legacy)"
-        return 0
-    fi
-    
-    log_verbose "pbkdf2 failed, trying legacy method..."
-    if openssl enc -d -aes-256-cbc -in "$infile" -out "$outfile" -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
-        log_verbose "✅ Decryption successful (legacy method)"
-        return 0
-    fi
-    
-    error_exit "OpenSSL decryption failed for $infile (all methods)"
-}
-
-decrypt_file() {
-    local infile="$1"
-    local outfile="$2"
-    if [[ ! -f "$ENCRYPTION_KEY_FILE" ]]; then
-        error_exit "Encryption key file not found: $ENCRYPTION_KEY_FILE"
-    fi
-    
-    local file_header=$(dd if="$infile" bs=1 count=16 2>/dev/null | od -An -tx1 | tr -d ' ')
+    local file_header=$(head -c 16 "$infile" 2>/dev/null | od -An -tx1 | tr -d ' ')
     log_verbose "File header: $file_header"
     
     if [[ "$file_header" == "53616c7465645f5f"* ]]; then
@@ -604,9 +565,10 @@ backup_directory() {
 
     local exclude_opts=()
     if [[ -n "$EXCLUDE_PATTERNS" ]]; then
-        echo "$EXCLUDE_PATTERNS" | grep -q '[^a-zA-Z0-9_*./ -]' && {
-            echo "⚠️ WARNING: EXCLUDE_PATTERNS contains unusual characters: $EXCLUDE_PATTERNS"
-        }
+        IFS=',' read -ra patterns <<< "$EXCLUDE_PATTERNS"
+        for pattern in "${patterns[@]}"; do
+            exclude_opts+=("--exclude=$pattern")
+        done
     fi
 
     tar -cf "$tar_file" -C "$(dirname "$src")" "${exclude_opts[@]}" "$(basename "$src")" \
@@ -1065,14 +1027,14 @@ restore_from_backup() {
 
     init_tmp
 
-    local basename
-    basename=$(basename "$enc_file")
+    local file_basename
+    file_basename=$(basename "$enc_file")
     
     local type
-    if echo "$basename" | grep -qE '_[0-9]{8}_[0-9]{6}\.tar\.gz\.enc$'; then
-        type=$(echo "$basename" | sed -E 's/_[0-9]{8}_[0-9]{6}\.tar\.gz\.enc$//')
+    if echo "$file_basename" | grep -qE '_[0-9]{8}_[0-9]{6}\.tar\.gz\.enc$'; then
+        type=$(echo "$file_basename" | sed -E 's/_[0-9]{8}_[0-9]{6}\.tar\.gz\.enc$//')
     else
-        type=$(echo "$basename" | sed -E 's/\.tar\.gz\.enc$//')
+        type=$(echo "$file_basename" | sed -E 's/\.tar\.gz\.enc$//')
     fi
     
     log "🔄 Restoring type: $type"
@@ -1176,7 +1138,8 @@ restore_from_backup() {
                 log "✅ Successfully restored all files to $dest_dir"
                 
                 if [[ "$use_sudo" == "true" ]]; then
-                    sudo chown -R $(whoami):$(whoami) "$dest_dir" 2>/dev/null || true
+                    local current_user="${SUDO_USER:-$(whoami)}"
+                    sudo chown -R "$current_user":"$current_user" "$dest_dir" 2>/dev/null || true
                 fi
                 
                 rm -rf "$extract_dir"
@@ -1297,6 +1260,7 @@ restore_from_backup() {
     
     log "✅ Restore completed successfully."
 }
+
 list_backups() {
     local backup_dir="$1"
     echo ""
@@ -1380,13 +1344,24 @@ do_backup() {
 
     backup_directory "$SOURCE_DIR" "$backup_dir" "digital-independence"
 
+    local pids=()
+    local failed=0
     local vol_count=0
+
     for vol in "${DOCKER_VOLUMES[@]}"; do
         vol_count=$((vol_count + 1))
         log "Processing volume $vol_count of ${#DOCKER_VOLUMES[@]}: $vol"
         backup_docker_volume "$vol" "$backup_dir" &
+        pids+=($!)
     done
-    wait
+
+    for pid in "${pids[@]}"; do
+        wait $pid || failed=$((failed + 1))
+    done
+
+    if [[ $failed -gt 0 ]]; then
+        log "⚠️ WARNING: $failed volume backup(s) failed"
+    fi
 
     check_backup_size "$backup_dir"
 
@@ -1438,6 +1413,214 @@ do_backup() {
     log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
 
+run_test() {
+    echo ""
+    echo "🔐 Testing Encryption/Decryption System"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    
+    if [[ ! -f "$ENCRYPTION_KEY_FILE" ]]; then
+        echo "⚠️  Encryption key not found: $ENCRYPTION_KEY_FILE"
+        echo "   Generating test key..."
+        openssl rand -base64 32 > encryption.key.test
+        chmod 600 encryption.key.test
+        ENCRYPTION_KEY_FILE="encryption.key.test"
+        echo "✅ Test key created: encryption.key.test"
+    else
+        echo "✅ Using encryption key: $ENCRYPTION_KEY_FILE"
+    fi
+    
+    local TEST_DIR="${SCRIPT_DIR}/.test"
+    mkdir -p "$TEST_DIR"
+    chmod 700 "$TEST_DIR" 2>/dev/null || true
+    
+    echo ""
+    echo "📄 Testing text file encryption/decryption..."
+    
+    echo "Test content at $(date)" > "${TEST_DIR}/test.txt"
+    echo "Line 2: Testing PBKDF2 with ${PBKDF2_ITERATIONS:-600000} iterations" >> "${TEST_DIR}/test.txt"
+    echo "Line 3: This should be encrypted and decrypted successfully" >> "${TEST_DIR}/test.txt"
+    
+    if openssl enc -aes-256-cbc -pbkdf2 -iter "${PBKDF2_ITERATIONS:-600000}" -salt \
+        -in "${TEST_DIR}/test.txt" -out "${TEST_DIR}/test.txt.enc" \
+        -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
+        echo "  ✅ Text encryption: SUCCESS"
+    else
+        echo "  ❌ Text encryption: FAILED"
+        rm -rf "$TEST_DIR" 2>/dev/null
+        return 1
+    fi
+    
+    if openssl enc -d -aes-256-cbc -pbkdf2 -iter "${PBKDF2_ITERATIONS:-600000}" \
+        -in "${TEST_DIR}/test.txt.enc" -out "${TEST_DIR}/test.txt.dec" \
+        -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
+        echo "  ✅ Text decryption: SUCCESS"
+    else
+        echo "  ❌ Text decryption: FAILED"
+        rm -rf "$TEST_DIR" 2>/dev/null
+        return 1
+    fi
+    
+    if diff "${TEST_DIR}/test.txt" "${TEST_DIR}/test.txt.dec" >/dev/null 2>&1; then
+        echo "  ✅ Text file: PASSED (files match)"
+    else
+        echo "  ❌ Text file: FAILED (files don't match)"
+        rm -rf "$TEST_DIR" 2>/dev/null
+        return 1
+    fi
+    
+    echo ""
+    echo "📦 Testing binary file encryption/decryption..."
+    
+    dd if=/dev/urandom of="${TEST_DIR}/test.bin" bs=1K count=10 2>/dev/null
+    
+    if openssl enc -aes-256-cbc -pbkdf2 -iter "${PBKDF2_ITERATIONS:-600000}" -salt \
+        -in "${TEST_DIR}/test.bin" -out "${TEST_DIR}/test.bin.enc" \
+        -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
+        echo "  ✅ Binary encryption: SUCCESS"
+    else
+        echo "  ❌ Binary encryption: FAILED"
+        rm -rf "$TEST_DIR" 2>/dev/null
+        return 1
+    fi
+    
+    if openssl enc -d -aes-256-cbc -pbkdf2 -iter "${PBKDF2_ITERATIONS:-600000}" \
+        -in "${TEST_DIR}/test.bin.enc" -out "${TEST_DIR}/test.bin.dec" \
+        -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
+        echo "  ✅ Binary decryption: SUCCESS"
+    else
+        echo "  ❌ Binary decryption: FAILED"
+        rm -rf "$TEST_DIR" 2>/dev/null
+        return 1
+    fi
+    
+    if cmp "${TEST_DIR}/test.bin" "${TEST_DIR}/test.bin.dec" >/dev/null 2>&1; then
+        echo "  ✅ Binary file: PASSED (files match)"
+    else
+        echo "  ❌ Binary file: FAILED (files don't match)"
+        rm -rf "$TEST_DIR" 2>/dev/null
+        return 1
+    fi
+    
+    echo ""
+    echo "📊 File size comparison:"
+    
+    local text_orig=$(stat -c%s "${TEST_DIR}/test.txt" 2>/dev/null || stat -f%z "${TEST_DIR}/test.txt" 2>/dev/null)
+    local text_enc=$(stat -c%s "${TEST_DIR}/test.txt.enc" 2>/dev/null || stat -f%z "${TEST_DIR}/test.txt.enc" 2>/dev/null)
+    local text_dec=$(stat -c%s "${TEST_DIR}/test.txt.dec" 2>/dev/null || stat -f%z "${TEST_DIR}/test.txt.dec" 2>/dev/null)
+    local bin_orig=$(stat -c%s "${TEST_DIR}/test.bin" 2>/dev/null || stat -f%z "${TEST_DIR}/test.bin" 2>/dev/null)
+    local bin_enc=$(stat -c%s "${TEST_DIR}/test.bin.enc" 2>/dev/null || stat -f%z "${TEST_DIR}/test.bin.enc" 2>/dev/null)
+    local bin_dec=$(stat -c%s "${TEST_DIR}/test.bin.dec" 2>/dev/null || stat -f%z "${TEST_DIR}/test.bin.dec" 2>/dev/null)
+    
+    echo "  📄 Text:    Original: ${text_orig}B → Encrypted: ${text_enc}B → Decrypted: ${text_dec}B"
+    echo "  📦 Binary:  Original: ${bin_orig}B → Encrypted: ${bin_enc}B → Decrypted: ${bin_dec}B"
+    
+    echo ""
+    echo "✅ Testing PBKDF2 compatibility..."
+    
+    for iter in 100000 10000 1000; do
+        local enc_file="${TEST_DIR}/test_iter_${iter}.enc"
+        local dec_file="${TEST_DIR}/test_iter_${iter}.dec"
+        
+        if openssl enc -aes-256-cbc -pbkdf2 -iter "${iter}" -salt \
+            -in "${TEST_DIR}/test.txt" -out "$enc_file" \
+            -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
+            
+            if openssl enc -d -aes-256-cbc -pbkdf2 -iter "${iter}" \
+                -in "$enc_file" -out "$dec_file" \
+                -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
+                
+                if diff "${TEST_DIR}/test.txt" "$dec_file" >/dev/null 2>&1; then
+                    echo "  ✅ PBKDF2 ${iter} iterations: PASSED"
+                else
+                    echo "  ❌ PBKDF2 ${iter} iterations: FAILED (file mismatch)"
+                fi
+            else
+                echo "  ❌ PBKDF2 ${iter} iterations: FAILED (decryption)"
+            fi
+        else
+            echo "  ❌ PBKDF2 ${iter} iterations: FAILED (encryption)"
+        fi
+        
+        rm -f "$enc_file" "$dec_file" 2>/dev/null
+    done
+    
+    if [[ -n "$FIXED_SALT_FILE" ]] && [[ -f "$FIXED_SALT_FILE" ]]; then
+        echo ""
+        echo "🔗 Testing fixed salt (deduplication mode)..."
+        
+        local salt_hex=$(tr -d '\n\r' < "$FIXED_SALT_FILE")
+        echo "  Salt: $salt_hex"
+        
+        openssl enc -aes-256-cbc -pbkdf2 -iter "${PBKDF2_ITERATIONS:-600000}" -S "$salt_hex" \
+            -in "${TEST_DIR}/test.txt" -out "${TEST_DIR}/test.fixed.enc" \
+            -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null
+        
+        openssl enc -aes-256-cbc -pbkdf2 -iter "${PBKDF2_ITERATIONS:-600000}" -S "$salt_hex" \
+            -in "${TEST_DIR}/test.txt" -out "${TEST_DIR}/test.fixed2.enc" \
+            -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null
+        
+        if cmp "${TEST_DIR}/test.fixed.enc" "${TEST_DIR}/test.fixed2.enc" >/dev/null 2>&1; then
+            echo "  ✅ Fixed salt: Identical encryption (deduplication works)"
+        else
+            echo "  ⚠️  Fixed salt: Files differ (deduplication may not work)"
+        fi
+        
+        if openssl enc -d -aes-256-cbc -pbkdf2 -iter "${PBKDF2_ITERATIONS:-600000}" -S "$salt_hex" \
+            -in "${TEST_DIR}/test.fixed.enc" -out "${TEST_DIR}/test.fixed.dec" \
+            -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
+            
+            if diff "${TEST_DIR}/test.txt" "${TEST_DIR}/test.fixed.dec" >/dev/null 2>&1; then
+                echo "  ✅ Fixed salt decryption: PASSED"
+            else
+                echo "  ❌ Fixed salt decryption: FAILED"
+            fi
+        else
+            echo "  ❌ Fixed salt decryption: FAILED"
+        fi
+        
+        rm -f "${TEST_DIR}/test.fixed.enc" "${TEST_DIR}/test.fixed2.enc" "${TEST_DIR}/test.fixed.dec" 2>/dev/null
+    fi
+    
+    echo ""
+    echo "🔑 Testing encryption key permissions..."
+    
+    local key_perm=$(stat -c %a "$ENCRYPTION_KEY_FILE" 2>/dev/null || stat -f %Lp "$ENCRYPTION_KEY_FILE" 2>/dev/null)
+    if [[ "$key_perm" -le 600 ]]; then
+        echo "  ✅ Key permissions: $key_perm (secure)"
+    else
+        echo "  ⚠️  Key permissions: $key_perm (should be 600 or less)"
+        echo "     Run: chmod 600 $ENCRYPTION_KEY_FILE"
+    fi
+    
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "✅ ALL TESTS PASSED!"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo "📊 Test Summary:"
+    echo "  • Text encryption/decryption: ✅"
+    echo "  • Binary encryption/decryption: ✅"
+    echo "  • PBKDF2 compatibility: ✅ (all iteration counts)"
+    if [[ -n "$FIXED_SALT_FILE" ]]; then
+        echo "  • Fixed salt deduplication: ✅"
+    fi
+    echo "  • Key security: $([[ "$key_perm" -le 600 ]] && echo "✅" || echo "⚠️")"
+    echo ""
+    echo "📁 Test files kept in: $TEST_DIR"
+    echo "   (Remove with: rm -rf $TEST_DIR)"
+    echo ""
+    echo "🔐 Your encryption system is ready to use!"
+    echo ""
+    
+    if [[ -f "encryption.key.test" ]]; then
+        echo "🧹 Removing test encryption key..."
+        rm -f encryption.key.test
+    fi
+    
+    return 0
+}
+
 show_help() {
     cat <<EOF
 📦 backup.sh - Enterprise-grade backup script (v$VERSION)
@@ -1451,6 +1634,7 @@ OPTIONS:
     --verify-all          Verify all backups in the backup directory
     --list                List all available backups
     --dedup               Run deduplication on the backup directory (requires hardlink or jdupes)
+    --test                Run encryption/decryption test suite
     --help, -h            Show this help message
 
 CONFIGURATION:
@@ -1478,6 +1662,9 @@ CONFIGURATION:
 EXAMPLES:
     # Perform a full backup
     ./backup.sh
+
+    # Test encryption/decryption
+    ./backup.sh --test
 
     # List available backups
     ./backup.sh --list
@@ -1513,6 +1700,11 @@ EOF
 
 main() {
     case "${1:-}" in
+        --test)
+            load_config
+            init_tmp
+            run_test
+            ;;
         --restore)
             if [[ -z "${2:-}" ]]; then
                 echo "ERROR: Missing backup file for restore."

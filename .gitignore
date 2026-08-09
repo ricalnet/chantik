@@ -1,7 +1,9 @@
 backup.conf
 encryption.key
+*enc
 *.lock
 *.log
 *.tmp
+*.test
 .backup_state
 *.txt
