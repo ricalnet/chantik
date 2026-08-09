@@ -1,0 +1,96 @@
+# 🕊️ Chantik Configuration File
+# =====================================
+# 💬 ChaCha20-Authenticated Backup Protection
+# 🙏 In ChaCha We Trust — Authentically Secured
+#
+# Copy this from chantik.conf.example and customize for your environment.
+
+# =============================================================================
+# SECURITY NOTES
+# =============================================================================
+#
+# 1. NEVER commit this file to version control
+# 2. Protect encryption.key: chmod 600 encryption.key
+# 3. Protect this config: chmod 600 chantik.conf
+# 4. Store encryption.key and config in separate secure locations
+# 5. Use strong passwords for ntfy.sh token
+# 6. Consider using environment variables for sensitive values
+#
+# Run with verbose mode for detailed logs:
+# VERBOSE=true ./chantik.sh
+#
+# Test encryption/decryption:
+# ./chantik.sh --test
+#
+# =============================================================================
+
+# Where all encrypted backups will be stored
+BACKUP_BASE_DIR="/media/backup"
+
+# The main directory you want to protect
+SOURCE_DIR="/home/user/digital-independence"
+
+# List of Docker volume names (space-separated in parentheses)
+DOCKER_VOLUMES=(
+    "volume1"
+    "volume2"
+    "volume3"
+)
+
+# Generate with: openssl rand -base64 32 > encryption.key
+# Protect with: chmod 600 encryption.key
+ENCRYPTION_KEY_FILE="/home/user/chantik/encryption.key"
+
+# Get your token from: https://ntfy.sh/account
+NTFY_TOPIC="my-backup-topic"
+NTFY_TOKEN="tk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# Custom ntfy.sh server (optional)
+# Use your own ntfy server instance
+# NTFY_CUSTOM_SERVER=""
+
+# How many backups to keep for each category
+RETENTION_DAILY=7      # Keep last 7 daily backups
+RETENTION_WEEKLY=4     # Keep last 4 weekly backups
+RETENTION_MONTHLY=6    # Keep last 6 monthly backups
+
+# Gzip compression level (1-9)
+# Higher = smaller files but slower compression
+GZIP_LEVEL=6
+
+# Docker image for backup operations
+DOCKER_IMAGE="alpine:latest"
+
+# Set to true for detailed debug output
+VERBOSE=false
+
+# Each backup will be stored in: ${BACKUP_PREFIX}_${timestamp}
+BACKUP_PREFIX="chantik-backup"
+
+# Files/directories matching these patterns will be excluded from backup
+# Example: "*.tmp,*.log,node_modules,*.cache"
+EXCLUDE_PATTERNS="*.tmp,*.log,*.swp,*.bak"
+
+# Maximum backup size in MB (0 = unlimited)
+MAX_BACKUP_SIZE_MB=0
+
+# Fixed salt file for deterministic encryption (deduplication)
+# Generate with: openssl rand -hex 8 > fixed_salt.txt
+FIXED_SALT_FILE="/home/user/chantik/fixed_salt.txt"
+
+# Deduplication tool
+# Options: "hardlink" (default), "jdupes", or "" (disable)
+DEDUP_TOOL="hardlink"
+
+# PBKDF2 iterations for key derivation
+# Higher = more secure but slower
+# Minimum: 100000 (for legacy systems)
+PBKDF2_ITERATIONS=600000
+
+# Enable to save storage and speed up backups
+INCREMENTAL_ENABLED=true
+
+# Full backup interval (in days)
+# How often to perform a full backup (vs incremental)
+# Only used when INCREMENTAL_ENABLED=true
+FULL_BACKUP_INTERVAL=7

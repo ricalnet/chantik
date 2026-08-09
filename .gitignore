@@ -1,9 +1,6 @@
-backup.conf
-encryption.key
-*enc
-*.lock
-*.log
-*.tmp
 *.test
-.backup_state
+*.tmp
 *.txt
+*.key
+*.log
+chantik.conf

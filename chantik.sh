@@ -1,28 +1,34 @@
 #!/usr/bin/env bash
 #
-# backup.sh - Enterprise-grade backup script for directories and Docker volumes
-#             with encryption, compression, smart retention, and detailed notifications.
+# chantik.sh - 🕊️ ChaCha20-Authenticated Backup Protection
+# Backup solution for directories and Docker volumes
+# with ChaCha20-Poly1305 encryption, compression, smart retention, 
+# incremental backups, deduplication, and real-time notifications.
 #
-# Security: All sensitive configuration is stored in backup.conf
+# Security: All sensitive configuration is stored in chantik.conf
 #           which should be excluded from version control.
 
 set -euo pipefail
 IFS=$'\n\t'
 
-VERSION="0.1.0"
+VERSION="0.1.1"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 
 # -----------------------------------------------------------------------------
 # Global Settings
 # -----------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_FILE="${SCRIPT_DIR}/backup.conf"
-CONFIG_EXAMPLE="${SCRIPT_DIR}/backup.conf.example"
-LOCK_FILE="${SCRIPT_DIR}/.backup.lock"
-LOG_FILE="${SCRIPT_DIR}/backup.log"
+CONFIG_FILE="${SCRIPT_DIR}/chantik.conf"
+CONFIG_EXAMPLE="${SCRIPT_DIR}/chantik.conf.example"
+LOCK_FILE="${SCRIPT_DIR}/.chantik.lock"
+LOG_FILE="${SCRIPT_DIR}/chantik.log"
 TMP_DIR="${SCRIPT_DIR}/.tmp"
 BACKUP_START_TIME=0
 BACKUP_END_TIME=0
+BRAND_NAME="Chantik"
+BRAND_TAGLINE="ChaCha20-Authenticated Backup Protection"
+BRAND_MOTTO="In ChaCha We Trust — Authentically Secured"
+BRAND_EMOJI="🕊️"
 
 # Default values (will be overridden by config)
 BACKUP_BASE_DIR=""
@@ -37,13 +43,17 @@ ENCRYPTION_KEY_FILE=""
 GZIP_LEVEL=6
 DOCKER_IMAGE="alpine:latest"
 VERBOSE=false
-BACKUP_PREFIX="backup"
+BACKUP_PREFIX="chantik-backup"
 EXCLUDE_PATTERNS=""
 MAX_BACKUP_SIZE_MB=0
 NTFY_CUSTOM_SERVER=""
 FIXED_SALT_FILE=""
 DEDUP_TOOL="hardlink"
 PBKDF2_ITERATIONS=600000
+INCREMENTAL_ENABLED=false
+INCREMENTAL_BASE_DIR="${BACKUP_BASE_DIR}/.incremental"
+SNAPSHOT_FILE=""
+FULL_BACKUP_INTERVAL=7
 
 check_chacha20_support() {
     if openssl enc -chacha20 -help 2>&1 | grep -q "unknown option"; then
@@ -58,9 +68,9 @@ check_chacha20_support() {
 
 load_config() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
-        echo "ERROR: Configuration file not found: $CONFIG_FILE"
+        echo "🕊️ ERROR: Configuration file not found: $CONFIG_FILE"
         echo ""
-        echo "To set up your configuration:"
+        echo "To set up your Chantik configuration:"
         echo "  1. Copy the example template:"
         echo "     cp $CONFIG_EXAMPLE $CONFIG_FILE"
         echo "  2. Edit $CONFIG_FILE with your values"
@@ -90,12 +100,16 @@ load_config() {
     done
 
     if [[ ${#missing_vars[@]} -gt 0 ]]; then
-        echo "ERROR: Missing required configuration variables in $CONFIG_FILE:"
+        echo "🕊️ ERROR: Missing required configuration variables in $CONFIG_FILE:"
         printf "  - %s\n" "${missing_vars[@]}"
         echo ""
         echo "Please update $CONFIG_FILE with your values."
         exit 1
     fi
+
+    INCREMENTAL_ENABLED="${INCREMENTAL_ENABLED:-false}"
+    FULL_BACKUP_INTERVAL="${FULL_BACKUP_INTERVAL:-7}"
+    INCREMENTAL_BASE_DIR="${BACKUP_BASE_DIR}/.incremental"
 
     if [[ -n "${PBKDF2_ITERATIONS:-}" ]]; then
         if [[ ! "$PBKDF2_ITERATIONS" =~ ^[0-9]+$ ]] || [[ "$PBKDF2_ITERATIONS" -lt 100000 ]]; then
@@ -122,7 +136,7 @@ load_config() {
     fi
 
     if [[ ! -f "$ENCRYPTION_KEY_FILE" ]]; then
-        echo "ERROR: Encryption key file not found: $ENCRYPTION_KEY_FILE"
+        echo "🕊️ ERROR: Encryption key file not found: $ENCRYPTION_KEY_FILE"
         echo ""
         echo "Generate one using:"
         echo "  openssl rand -base64 32 > encryption.key"
@@ -131,23 +145,31 @@ load_config() {
     fi
 
     if [[ ! -d "$SOURCE_DIR" ]]; then
-        echo "ERROR: Source directory does not exist: $SOURCE_DIR"
+        echo "🕊️ ERROR: Source directory does not exist: $SOURCE_DIR"
         exit 1
     fi
 
     mkdir -p "$BACKUP_BASE_DIR" 2>/dev/null || {
-        echo "ERROR: Cannot create backup directory: $BACKUP_BASE_DIR"
+        echo "🕊️ ERROR: Cannot create backup directory: $BACKUP_BASE_DIR"
         exit 1
     }
 
     if [[ ! -w "$BACKUP_BASE_DIR" ]]; then
-        echo "ERROR: Backup directory is not writable: $BACKUP_BASE_DIR"
+        echo "🕊️ ERROR: Backup directory is not writable: $BACKUP_BASE_DIR"
         exit 1
+    fi
+
+    if [[ "$INCREMENTAL_ENABLED" == "true" ]]; then
+        mkdir -p "$INCREMENTAL_BASE_DIR" 2>/dev/null || {
+            echo "🕊️ ERROR: Cannot create incremental directory: $INCREMENTAL_BASE_DIR"
+            exit 1
+        }
+        log_verbose "Incremental backup enabled (base: $INCREMENTAL_BASE_DIR)"
     fi
 
     if [[ -n "$FIXED_SALT_FILE" ]]; then
         if [[ ! -f "$FIXED_SALT_FILE" ]]; then
-            echo "ERROR: Fixed salt file not found: $FIXED_SALT_FILE"
+            echo "🕊️ ERROR: Fixed salt file not found: $FIXED_SALT_FILE"
             echo "Generate a fixed salt (16 hex chars) with:"
             echo "  openssl rand -hex 8 > fixed_salt.txt"
             exit 1
@@ -155,7 +177,7 @@ load_config() {
         local salt_content
         salt_content=$(tr -d '\n\r' < "$FIXED_SALT_FILE")
         if [[ ! "$salt_content" =~ ^[0-9a-fA-F]{16}$ ]]; then
-            echo "ERROR: Fixed salt file must contain exactly 16 hex characters (8 bytes)."
+            echo "🕊️ ERROR: Fixed salt file must contain exactly 16 hex characters (8 bytes)."
             echo "Current content: $salt_content"
             exit 1
         fi
@@ -192,7 +214,7 @@ load_config() {
         fi
     done
     if [[ ${#missing_tools[@]} -gt 0 ]]; then
-        echo "ERROR: Required tools not found: ${missing_tools[*]}"
+        echo "🕊️ ERROR: Required tools not found: ${missing_tools[*]}"
         echo "Please install them and try again."
         exit 1
     fi
@@ -219,7 +241,7 @@ log_verbose() {
 
 error_exit() {
     local msg="$*"
-    log "ERROR: $msg"
+    log "🕊️ ERROR: $msg"
     
     local error_msg="❌ Error: $msg\n⏱️ Time: $(date '+%Y-%m-%d %H:%M:%S')\n📝 Log: $LOG_FILE"
     
@@ -249,22 +271,22 @@ send_ntfy() {
         error)   
             priority="5"
             tags="red_circle"
-            title="❌ BACKUP FAILED"
+            title="🕊️ CHANTIK FAILED"
             ;;
         success) 
             priority="3"
             tags="white_check_mark"
-            title="✅ BACKUP SUCCESS"
+            title="🕊️ CHANTIK SUCCESS"
             ;;
         info)    
             priority="3"
             tags="information_source"
-            title="ℹ️ BACKUP INFO"
+            title="🕊️ CHANTIK INFO"
             ;;
         restore)
             priority="3"
             tags="arrows_counterclockwise"
-            title="🔄 RESTORE COMPLETED"
+            title="🕊️ CHANTIK RESTORE"
             ;;
     esac
     
@@ -617,15 +639,154 @@ fix_encrypted_filename() {
     fi
 }
 
-backup_directory() {
+get_snapshot_file() {
+    local backup_type="$1"
+    local snapshot_name="${backup_type}.snar"
+    echo "${INCREMENTAL_BASE_DIR}/${snapshot_name}"
+}
+
+get_last_full_backup() {
+    local backup_type="$1"
+    local snapshot_file=$(get_snapshot_file "$backup_type")
+    
+    if [[ -f "$snapshot_file" ]]; then
+        local last_full=$(grep "^full:" "$snapshot_file" 2>/dev/null | tail -1 | cut -d: -f2)
+        
+        echo "DEBUG get_last_full_backup: $backup_type -> $last_full" >&2
+        
+        if [[ -z "$last_full" ]]; then
+            echo "0"
+        else
+            echo "$last_full"
+        fi
+    else
+        echo "DEBUG get_last_full_backup: $backup_type -> 0 (no file)" >&2
+        echo "0"
+    fi
+}
+
+should_do_full_backup() {
+    local backup_type="$1"
+    
+    if [[ "$INCREMENTAL_ENABLED" != "true" ]]; then
+        echo "DEBUG should_do_full_backup: $backup_type -> FULL (incremental disabled)" >&2
+        return 0
+    fi
+    
+    local last_full=$(get_last_full_backup "$backup_type")
+    local current_time=$(date +%s)
+    local days_since=$(( (current_time - last_full) / 86400 ))
+    
+    echo "DEBUG should_do_full_backup: $backup_type: last_full=$last_full, days_since=$days_since, threshold=$FULL_BACKUP_INTERVAL" >&2
+    
+    if [[ $last_full -eq 0 ]]; then
+        echo "DEBUG should_do_full_backup: $backup_type -> FULL (no previous full)" >&2
+        return 0
+    elif [[ $days_since -ge $FULL_BACKUP_INTERVAL ]]; then
+        echo "DEBUG should_do_full_backup: $backup_type -> FULL (scheduled)" >&2
+        return 0
+    else
+        echo "DEBUG should_do_full_backup: $backup_type -> INCREMENTAL" >&2
+        return 1
+    fi
+}
+
+update_snapshot_full_time() {
+    local backup_type="$1"
+    local snapshot_file=$(get_snapshot_file "$backup_type")
+    local current_time=$(date +%s)
+    
+    log_verbose "Updating full timestamp for $backup_type to $current_time"
+    
+    mkdir -p "$(dirname "$snapshot_file")" 2>/dev/null || true
+    
+    if [[ -f "$snapshot_file" ]]; then
+        if grep -q "^full:" "$snapshot_file" 2>/dev/null; then
+            sed -i "s/^full:.*/full:$current_time/" "$snapshot_file" 2>/dev/null || true
+            log_verbose "✅ Updated existing full: timestamp"
+        else
+            echo "full:$current_time" >> "$snapshot_file"
+            log_verbose "✅ Added full: timestamp to existing snapshot"
+        fi
+    else
+        cat > "$snapshot_file" << EOF
+last_backup:$current_time
+full:$current_time
+EOF
+        log_verbose "✅ Created new snapshot with full: timestamp"
+    fi
+    
+    if grep -q "^full:" "$snapshot_file" 2>/dev/null; then
+        log_verbose "✅ Verified full: timestamp in snapshot"
+    else
+        log_verbose "⚠️ WARNING: Failed to add full: timestamp"
+        echo "full:$current_time" >> "$snapshot_file" 2>/dev/null || true
+    fi
+}
+
+backup_directory_incremental() {
     local src="$1"
     local dest_dir="$2"
     local name="$3"
     local archive_base="${dest_dir}/${name}"
+    
+    local backup_type="dir_${name}"
+    local snapshot_file=$(get_snapshot_file "$backup_type")
+    
+    if [[ -f "$snapshot_file" ]]; then
+        if ! grep -q "^last_backup:" "$snapshot_file" 2>/dev/null; then
+            log "⚠️ Snapshot file $snapshot_file is corrupted. Removing it and forcing full backup."
+            rm -f "$snapshot_file"
+            rm -f "${INCREMENTAL_BASE_DIR}/${backup_type}_inc_*.snar" 2>/dev/null || true
+            rm -f "${INCREMENTAL_BASE_DIR}/${backup_type}"*.snar 2>/dev/null || true
+        fi
+    fi
+    
+    local do_full=false
+    local backup_suffix=""
+    local last_backup_time=0
+    
+    if [[ "$INCREMENTAL_ENABLED" != "true" ]]; then
+        do_full=true
+        log "📦 Performing FULL backup of $src (incremental disabled)"
+    else
+        if should_do_full_backup "$backup_type"; then
+            do_full=true
+            log "📦 Performing FULL backup of $src (scheduled full backup)"
+        else
+            if [[ -f "$snapshot_file" ]]; then
+                last_backup_time=$(grep "^last_backup:" "$snapshot_file" 2>/dev/null | cut -d: -f2)
+                
+                if [[ -n "$last_backup_time" ]] && [[ "$last_backup_time" -gt 0 ]]; then
+                    do_full=false
+                    local last_date=$(date -d "@$last_backup_time" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown")
+                    log "📦 Performing INCREMENTAL backup of $src (since $last_date)"
+                else
+                    do_full=true
+                    log "⚠️ Invalid snapshot timestamp. Forcing FULL backup."
+                    rm -f "$snapshot_file"
+                fi
+            else
+                do_full=true
+                log "📦 Performing FULL backup of $src (no snapshot found)"
+            fi
+        fi
+    fi
+    
     local tar_file="${archive_base}.tar"
     local gz_file="${tar_file}.gz"
     local enc_file="${gz_file}.enc"
-
+    
+    if [[ "$do_full" == "true" ]]; then
+        backup_suffix="full"
+    else
+        backup_suffix="inc"
+    fi
+    
+    local final_tar_file="${archive_base}_${backup_suffix}.tar"
+    local final_gz_file="${final_tar_file}.gz"
+    local final_enc_file="${final_gz_file}.enc"
+    
     log "Backing up directory: $src"
     if [[ ! -d "$src" ]]; then
         error_exit "Source directory $src does not exist"
@@ -639,95 +800,384 @@ backup_directory() {
         done
     fi
 
-    tar -cf "$tar_file" -C "$(dirname "$src")" "${exclude_opts[@]}" "$(basename "$src")" \
-        --preserve-permissions --same-owner --xattrs 2>/dev/null || \
-        tar -cf "$tar_file" -C "$(dirname "$src")" "${exclude_opts[@]}" "$(basename "$src")" \
-        --preserve-permissions --same-owner
-
-    log "🗜️ Compressing with gzip level $GZIP_LEVEL..."
-    gzip -$GZIP_LEVEL "$tar_file" 2>/dev/null || error_exit "Compression failed for $tar_file"
-    log "✅ Compression complete"
-    if [[ ! -f "$gz_file" ]]; then
-        error_exit "Compression failed for $tar_file"
+    if [[ "$do_full" == "true" ]]; then
+        log "Creating FULL backup archive..."
+        
+        tar -cf "$tar_file" -C "$(dirname "$src")" "${exclude_opts[@]}" \
+            --preserve-permissions --same-owner --xattrs \
+            "$(basename "$src")" 2>/dev/null || \
+            tar -cf "$tar_file" -C "$(dirname "$src")" "${exclude_opts[@]}" \
+            --preserve-permissions --same-owner \
+            "$(basename "$src")" 2>/dev/null || {
+                error_exit "Failed to create full tar archive"
+            }
+        
+        update_snapshot_full_time "$backup_type"
+        
+        if [[ -f "$snapshot_file" ]]; then
+            if grep -q "^last_backup:" "$snapshot_file" 2>/dev/null; then
+                sed -i "s/^last_backup:.*/last_backup:$(date +%s)/" "$snapshot_file" 2>/dev/null || true
+            else
+                echo "last_backup:$(date +%s)" >> "$snapshot_file"
+            fi
+        else
+            echo "last_backup:$(date +%s)" > "$snapshot_file"
+            echo "full:$(date +%s)" >> "$snapshot_file"
+        fi
+        
+        log_verbose "Updated snapshot: $snapshot_file"
+        
+    else
+        log "Creating INCREMENTAL backup archive..."
+        
+        local changed_files="${TMP_DIR}/changed_files_${backup_type}_$$.txt"
+        local file_count=0
+        
+        if command -v find &>/dev/null; then
+            if find "$src" -type f -newermt "@$last_backup_time" > "$changed_files" 2>/dev/null; then
+                file_count=$(wc -l < "$changed_files" 2>/dev/null || echo 0)
+            elif [[ -f "$snapshot_file" ]] && find "$src" -type f -newer "$snapshot_file" > "$changed_files" 2>/dev/null; then
+                file_count=$(wc -l < "$changed_files" 2>/dev/null || echo 0)
+            else
+                find "$src" -type f -mtime -1 > "$changed_files" 2>/dev/null
+                file_count=$(wc -l < "$changed_files" 2>/dev/null || echo 0)
+            fi
+        else
+            if command -v rsync &>/dev/null; then
+                rsync -avn --delete "$src/" /dev/null 2>/dev/null | grep -v "^sending" | grep -v "^$" > "$changed_files" 2>/dev/null
+                file_count=$(wc -l < "$changed_files" 2>/dev/null || echo 0)
+            else
+                log "⚠️ Cannot detect changes. Forcing FULL backup."
+                rm -f "$changed_files" 2>/dev/null
+                do_full=true
+                backup_directory_incremental "$src" "$dest_dir" "$name"
+                return $?
+            fi
+        fi
+        
+        sed -i '/^$/d' "$changed_files" 2>/dev/null || true
+        
+        if [[ -s "$changed_files" ]]; then
+            log "📊 Found $file_count changed files"
+            
+            tar -cf "$tar_file" -C "$(dirname "$src")" \
+                --preserve-permissions --same-owner --xattrs \
+                --files-from="$changed_files" 2>/dev/null || \
+                tar -cf "$tar_file" -C "$(dirname "$src")" \
+                --preserve-permissions --same-owner \
+                --files-from="$changed_files" 2>/dev/null || {
+                    log_verbose "Tar with --files-from failed, trying alternative method..."
+                    sed "s|^$(dirname "$src")/||" "$changed_files" > "${changed_files}.rel" 2>/dev/null
+                    tar -cf "$tar_file" -C "$(dirname "$src")" \
+                        --preserve-permissions --same-owner \
+                        -T "${changed_files}.rel" 2>/dev/null || {
+                        rm -f "$changed_files" "${changed_files}.rel" 2>/dev/null
+                        error_exit "Failed to create incremental tar archive"
+                    }
+                    rm -f "${changed_files}.rel" 2>/dev/null
+                }
+            
+            if [[ -f "$snapshot_file" ]]; then
+                if grep -q "^last_backup:" "$snapshot_file" 2>/dev/null; then
+                    sed -i "s/^last_backup:.*/last_backup:$(date +%s)/" "$snapshot_file" 2>/dev/null || true
+                else
+                    echo "last_backup:$(date +%s)" >> "$snapshot_file"
+                fi
+            else
+                echo "last_backup:$(date +%s)" > "$snapshot_file"
+                echo "full:$(date +%s)" >> "$snapshot_file"
+            fi
+            log_verbose "Updated snapshot: $snapshot_file"
+            
+        else
+            log "📊 No changes detected since last backup ($(date -d "@$last_backup_time" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown"))"
+            
+            touch "$tar_file"
+            
+            if [[ -f "$snapshot_file" ]]; then
+                if grep -q "^last_backup:" "$snapshot_file" 2>/dev/null; then
+                    sed -i "s/^last_backup:.*/last_backup:$(date +%s)/" "$snapshot_file" 2>/dev/null || true
+                else
+                    echo "last_backup:$(date +%s)" >> "$snapshot_file"
+                fi
+            else
+                echo "last_backup:$(date +%s)" > "$snapshot_file"
+                echo "full:$(date +%s)" >> "$snapshot_file"
+            fi
+        fi
+        
+        rm -f "$changed_files" 2>/dev/null
     fi
 
-    generate_checksums "$gz_file"
-    encrypt_file "$gz_file" "$enc_file"
-    if [[ -f "$enc_file" ]]; then
-        sha256sum "$enc_file" | awk '{print $1}' | sed "s/^/SHA256: /" > "${enc_file}.enc.checksums"
-        rm -f "$gz_file"
-        log "✅ Encrypted backup created: $(basename "$enc_file")"
+    if [[ ! -f "$tar_file" ]]; then
+        error_exit "Tar file not created: $tar_file"
+    fi
+    
+    if [[ ! -s "$tar_file" ]] && [[ "$do_full" == "false" ]]; then
+        log "📦 Empty incremental backup (no changes)"
+        rm -f "$tar_file" 2>/dev/null
+        log "✅ No changes to backup"
+        return 0
+    fi
+
+    mv "$tar_file" "$final_tar_file"
+
+    log "🗜️ Compressing with gzip level $GZIP_LEVEL..."
+    gzip -$GZIP_LEVEL "$final_tar_file" 2>/dev/null || error_exit "Compression failed for $final_tar_file"
+    log "✅ Compression complete"
+    
+    if [[ ! -f "$final_gz_file" ]] || [[ ! -s "$final_gz_file" ]]; then
+        error_exit "Compression failed for $final_tar_file"
+    fi
+
+    generate_checksums "$final_gz_file" "${final_gz_file}.checksums"
+    
+    log_verbose "Encrypting with ChaCha20..."
+    encrypt_file "$final_gz_file" "$final_enc_file"
+    
+    if [[ -f "$final_enc_file" ]] && [[ -s "$final_enc_file" ]]; then
+        sha256sum "$final_enc_file" | awk '{print $1}' | sed "s/^/SHA256: /" > "${final_enc_file}.enc.checksums"
+        
+        rm -f "$final_gz_file"
+        
+        if [[ "$do_full" == "true" ]]; then
+            log "✅ FULL encrypted backup created: $(basename "$final_enc_file") ($(human_size $(stat -c%s "$final_enc_file" 2>/dev/null || echo 0)))"
+        else
+            local file_count=0
+            if [[ -f "$final_tar_file" ]]; then
+                file_count=$(tar -tf "$final_tar_file" 2>/dev/null | wc -l || echo 0)
+            fi
+            log "✅ INCREMENTAL encrypted backup created: $(basename "$final_enc_file") ($(human_size $(stat -c%s "$final_enc_file" 2>/dev/null || echo 0)))"
+            if [[ $file_count -gt 0 ]]; then
+                log "📊 Changed files: $file_count"
+            fi
+        fi
+    else
+        error_exit "Encryption failed for $final_gz_file"
     fi
 }
 
-backup_docker_volume() {
+backup_docker_volume_incremental() {
     local volume="$1"
     local dest_dir="$2"
     local archive_base="${dest_dir}/volume_${volume}"
+    
+    local backup_type="vol_${volume}"
+    local snapshot_file=$(get_snapshot_file "$backup_type")
+    
+    if [[ -f "$snapshot_file" ]]; then
+        if ! grep -q "^last_backup:" "$snapshot_file" 2>/dev/null; then
+            log "⚠️ Snapshot file $snapshot_file is corrupted. Removing and forcing full backup."
+            rm -f "$snapshot_file"
+            rm -f "${INCREMENTAL_BASE_DIR}/${backup_type}_inc_*.snar" 2>/dev/null || true
+        fi
+    fi
+    
+    local do_full=false
+    local backup_suffix=""
+    local last_backup_time=0
+    
+    if [[ "$INCREMENTAL_ENABLED" != "true" ]]; then
+        do_full=true
+        log "📦 Performing FULL backup of Docker volume: $volume (incremental disabled)"
+    else
+        if should_do_full_backup "$backup_type"; then
+            do_full=true
+            log "📦 Performing FULL backup of Docker volume: $volume (scheduled full backup)"
+        else
+            if [[ -f "$snapshot_file" ]]; then
+                last_backup_time=$(grep "^last_backup:" "$snapshot_file" 2>/dev/null | cut -d: -f2)
+                if [[ -n "$last_backup_time" ]] && [[ "$last_backup_time" -gt 0 ]]; then
+                    do_full=false
+                    local last_date=$(date -d "@$last_backup_time" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown")
+                    log "📦 Performing INCREMENTAL backup of Docker volume: $volume (since $last_date)"
+                else
+                    do_full=true
+                    log "⚠️ Invalid snapshot timestamp. Forcing FULL backup."
+                    rm -f "$snapshot_file"
+                fi
+            else
+                do_full=true
+                log "📦 Performing FULL backup of Docker volume: $volume (no snapshot found)"
+            fi
+        fi
+    fi
+    
     local tar_file="${archive_base}.tar"
     local gz_file="${tar_file}.gz"
     local enc_file="${gz_file}.enc"
+    
+    if [[ "$do_full" == "true" ]]; then
+        backup_suffix="full"
+    else
+        backup_suffix="inc"
+    fi
+    
+    local final_tar_file="${archive_base}_${backup_suffix}.tar"
+    local final_gz_file="${final_tar_file}.gz"
+    local final_enc_file="${final_gz_file}.enc"
 
     log "📦 Backing up Docker volume: $volume"
     if ! docker volume inspect "$volume" &>/dev/null; then
         error_exit "Docker volume $volume does not exist"
     fi
 
-    local container_name="backup_vol_${volume}_$(date +%s)"
+    local container_name="chantik_backup_vol_${volume}_$(date +%s)"
     log_verbose "Creating container: $container_name"
     
-    if ! docker run --rm --name "$container_name" \
-        -v "$volume":/volume \
-        -v "$dest_dir":/backup \
+    local snapshot_volume="${volume}_snapshot"
+    docker volume create "$snapshot_volume" 2>/dev/null || true
+    
+    docker run --rm \
+        -v "$volume":/source:ro \
+        -v "$snapshot_volume":/target \
         "$DOCKER_IMAGE" \
-        tar -cf "/backup/${volume}.tar" -C /volume . \
-        --preserve-permissions --same-owner 2>/dev/null; then
+        cp -a /source/. /target/ 2>/dev/null || true
+    
+    if [[ "$do_full" == "true" ]]; then
+        log "Creating FULL backup archive for volume..."
         
-        log_verbose "First tar attempt failed, trying without permissions..."
         docker run --rm --name "$container_name" \
-            -v "$volume":/volume \
+            -v "$snapshot_volume":/volume \
             -v "$dest_dir":/backup \
-            alpine \
-            tar -cf "/backup/${volume}.tar" -C /volume . 2>/dev/null || {
-                error_exit "Failed to create tar for volume $volume"
+            "$DOCKER_IMAGE" \
+            sh -c "tar -cf '/backup/${volume}.tar' -C /volume . \
+                --preserve-permissions --same-owner 2>/dev/null" || \
+            docker run --rm --name "$container_name" \
+                -v "$snapshot_volume":/volume \
+                -v "$dest_dir":/backup \
+                alpine \
+                tar -cf "/backup/${volume}.tar" -C /volume . 2>/dev/null || {
+                    error_exit "Failed to create tar for volume $volume"
+                }
+        
+        update_snapshot_full_time "$backup_type"
+        
+        if [[ -f "$snapshot_file" ]]; then
+            if grep -q "^last_backup:" "$snapshot_file" 2>/dev/null; then
+                sed -i "s/^last_backup:.*/last_backup:$(date +%s)/" "$snapshot_file" 2>/dev/null || true
+            else
+                echo "last_backup:$(date +%s)" >> "$snapshot_file"
+            fi
+        else
+            echo "last_backup:$(date +%s)" > "$snapshot_file"
+            echo "full:$(date +%s)" >> "$snapshot_file"
+        fi
+        
+        log_verbose "Updated snapshot: $snapshot_file"
+        
+    else
+        log "Creating INCREMENTAL backup archive for volume..."
+        
+        local timestamp_file="${TMP_DIR}/.timestamp_${backup_type}_$$"
+        touch -d "@$last_backup_time" "$timestamp_file" 2>/dev/null || \
+            touch -t "$(date -d "@$last_backup_time" '+%Y%m%d%H%M.%S' 2>/dev/null || echo '197001010000.00')" "$timestamp_file" 2>/dev/null
+        
+        docker run --rm --name "$container_name" \
+            -v "$snapshot_volume":/volume \
+            -v "$dest_dir":/backup \
+            -v "$(dirname "$timestamp_file")":/timestamps \
+            "$DOCKER_IMAGE" \
+            sh -c "
+                TIMESTAMP_FILE='/timestamps/$(basename "$timestamp_file")'
+                if [ -f \"\$TIMESTAMP_FILE\" ]; then
+                    find /volume -type f -newer \"\$TIMESTAMP_FILE\" > /tmp/changed.txt 2>/dev/null
+                    if [ -s /tmp/changed.txt ]; then
+                        tar -cf '/backup/${volume}.tar' -C /volume --files-from=/tmp/changed.txt --preserve-permissions 2>/dev/null
+                    else
+                        touch '/backup/${volume}.tar'
+                    fi
+                else
+                    tar -cf '/backup/${volume}.tar' -C /volume . --preserve-permissions 2>/dev/null
+                fi
+            " || {
+                log_verbose "Incremental backup failed, creating full backup"
+                docker run --rm --name "${container_name}_full" \
+                    -v "$snapshot_volume":/volume \
+                    -v "$dest_dir":/backup \
+                    alpine \
+                    tar -cf "/backup/${volume}.tar" -C /volume . 2>/dev/null || {
+                        error_exit "Failed to create tar for volume $volume"
+                    }
+                do_full=true
             }
+        
+        rm -f "$timestamp_file" 2>/dev/null
+        
+        if [[ -f "$snapshot_file" ]]; then
+            if grep -q "^last_backup:" "$snapshot_file" 2>/dev/null; then
+                sed -i "s/^last_backup:.*/last_backup:$(date +%s)/" "$snapshot_file" 2>/dev/null || true
+            else
+                echo "last_backup:$(date +%s)" >> "$snapshot_file"
+            fi
+        else
+            echo "last_backup:$(date +%s)" > "$snapshot_file"
+            echo "full:$(date +%s)" >> "$snapshot_file"
+        fi
+        log_verbose "Updated snapshot: $snapshot_file"
     fi
+    
+    docker volume rm "$snapshot_volume" 2>/dev/null || true
 
     if [[ ! -f "${dest_dir}/${volume}.tar" ]]; then
         error_exit "Tar file not created for volume $volume"
     fi
 
-    mv "${dest_dir}/${volume}.tar" "$tar_file"
+    if [[ ! -s "${dest_dir}/${volume}.tar" ]] && [[ "$do_full" == "false" ]]; then
+        log "📦 Empty incremental backup (no changes in volume)"
+        rm -f "${dest_dir}/${volume}.tar" 2>/dev/null
+        log "✅ No changes to backup for volume $volume"
+        return 0
+    fi
+
+    mv "${dest_dir}/${volume}.tar" "$final_tar_file"
     
-    if ! tar -tf "$tar_file" &>/dev/null; then
-        error_exit "Tar file is corrupted or empty: $tar_file"
+    if ! tar -tf "$final_tar_file" &>/dev/null; then
+        error_exit "Tar file is corrupted or empty: $final_tar_file"
+    fi
+
+    if [[ "$do_full" == "true" ]]; then
+        update_snapshot_full_time "$backup_type"
+        touch "$snapshot_file"
     fi
 
     log "🗜️ Compressing with gzip level $GZIP_LEVEL..."
-    gzip -$GZIP_LEVEL "$tar_file" 2>/dev/null || error_exit "Compression failed for $tar_file"
-    if [[ ! -f "$gz_file" ]] || [[ ! -s "$gz_file" ]]; then
-        error_exit "Compression failed for $tar_file"
+    gzip -$GZIP_LEVEL "$final_tar_file" 2>/dev/null || error_exit "Compression failed for $final_tar_file"
+    if [[ ! -f "$final_gz_file" ]] || [[ ! -s "$final_gz_file" ]]; then
+        error_exit "Compression failed for $final_tar_file"
     fi
 
-    generate_checksums "$gz_file"
+    generate_checksums "$final_gz_file" "${final_gz_file}.checksums"
     
-    log_verbose "Encrypting volume backup..."
-    encrypt_file "$gz_file" "$enc_file"
+    log_verbose "Encrypting volume backup with ChaCha20..."
+    encrypt_file "$final_gz_file" "$final_enc_file"
     
-    if [[ -f "$enc_file" ]] && [[ -s "$enc_file" ]]; then
-        sha256sum "$enc_file" | awk '{print $1}' | sed "s/^/SHA256: /" > "${enc_file}.enc.checksums"
-        log_verbose "Created encrypted checksum: ${enc_file}.enc.checksums"
+    if [[ -f "$final_enc_file" ]] && [[ -s "$final_enc_file" ]]; then
+        sha256sum "$final_enc_file" | awk '{print $1}' | sed "s/^/SHA256: /" > "${final_enc_file}.enc.checksums"
+        log_verbose "Created encrypted checksum: ${final_enc_file}.enc.checksums"
         
-        rm -f "$gz_file"
-        log "✅ Encrypted volume backup created: $(basename "$enc_file") ($(human_size $(stat -c%s "$enc_file" 2>/dev/null || echo 0)))"
+        rm -f "$final_gz_file"
+        
+        if [[ "$do_full" == "true" ]]; then
+            log "✅ FULL encrypted volume backup created: $(basename "$final_enc_file") ($(human_size $(stat -c%s "$final_enc_file" 2>/dev/null || echo 0)))"
+        else
+            local file_count=0
+            if [[ -f "$final_tar_file" ]]; then
+                file_count=$(tar -tf "$final_tar_file" 2>/dev/null | wc -l || echo 0)
+            fi
+            log "✅ INCREMENTAL encrypted volume backup created: $(basename "$final_enc_file") ($(human_size $(stat -c%s "$final_enc_file" 2>/dev/null || echo 0)))"
+            if [[ $file_count -gt 0 ]]; then
+                log "📊 Changed files in volume: $file_count"
+            fi
+        fi
     else
-        error_exit "Encryption failed for $gz_file"
+        error_exit "Encryption failed for $final_gz_file"
     fi
 }
 
 generate_checksums() {
     local file="$1"
-    local checksum_file="${file}.checksums"
+    local checksum_file="${2:-${file}.checksums}"
     {
         sha256sum "$file" | awk '{print $1}' | sed "s/^/SHA256: /"
     } > "$checksum_file"
@@ -858,6 +1308,7 @@ rotate_backups() {
         if [[ "$type" == "$basename" ]]; then
             type=$(echo "$basename" | sed -E 's/\.tar\.gz\.enc$//')
         fi
+        type=$(echo "$type" | sed -E 's/_(full|inc)$//')
         echo "$type|$encfile"
     done < "$tmp_file" 2>/dev/null | sort > "$grouped_file" 2>/dev/null
 
@@ -921,6 +1372,7 @@ rotate_backups() {
             log "Deleting old backup: $f (age $age days, exceeds all retention)"
             rm -f "$f" 2>/dev/null
             rm -f "${f%.enc}.checksums" 2>/dev/null
+            rm -f "${f%.enc}.enc.checksums" 2>/dev/null
         done
     done
 
@@ -947,6 +1399,15 @@ verify_backup_integrity() {
         return 1
     fi
     echo "📦 File size: $(human_size "$file_size")"
+    
+    local filename=$(basename "$enc_file")
+    if [[ "$filename" == *_full* ]]; then
+        echo "📋 Type: FULL backup"
+    elif [[ "$filename" == *_inc* ]]; then
+        echo "📋 Type: INCREMENTAL backup"
+    else
+        echo "📋 Type: Unknown (legacy)"
+    fi
     
     local enc_checksum_file="${enc_file}.enc.checksums"
     
@@ -1125,6 +1586,8 @@ restore_from_backup() {
         type=$(echo "$file_basename" | sed -E 's/\.tar\.gz\.enc$//')
     fi
     
+    type=$(echo "$type" | sed -E 's/_(full|inc)$//')
+    
     log "🔄 Restoring type: $type"
 
     local tmp_dir
@@ -1133,7 +1596,7 @@ restore_from_backup() {
     trap 'rm -rf "$tmp_dir" 2>/dev/null || true; cleanup_temp; exit' INT TERM EXIT
     
     local decrypted_file="${tmp_dir}/$(basename "${enc_file%.enc}")"
-    log "🔐 Decrypting $(basename "$enc_file")..."
+    log "🔐 Decrypting $(basename "$enc_file") with ChaCha20..."
     decrypt_file "$enc_file" "$decrypted_file"
 
     if [[ ! -f "$decrypted_file" ]]; then
@@ -1163,7 +1626,7 @@ restore_from_backup() {
         error_exit "Decompression failed: $(basename "$tar_file") not found"
     fi
 
-    if [[ "$type" == "digital-independence" ]]; then
+    if [[ "$type" == "$(basename "$SOURCE_DIR")" ]] || [[ "$type" == "chantik-directory" ]] || [[ "$type" == "digital-independence" ]]; then
         local dest_dir="$SOURCE_DIR"
         dest_dir="${dest_dir%/}"
         
@@ -1259,8 +1722,8 @@ restore_from_backup() {
             log "⚠️ Warning: $dest_dir appears to be empty after restore"
         fi
         
-    elif [[ "$type" =~ ^volume_ ]]; then
-        local volume_name="${type#volume_}"
+    elif [[ "$type" =~ ^volume_ ]] || [[ "$type" =~ ^volume_.*_(full|inc)$ ]]; then
+        local volume_name=$(echo "$type" | sed -E 's/^volume_//' | sed -E 's/_(full|inc)$//')
         log "📦 Restoring Docker volume: $volume_name"
         
         if ! docker volume inspect "$volume_name" &>/dev/null; then
@@ -1276,7 +1739,7 @@ restore_from_backup() {
         
         local vol_first_entry=$(ls -A "$extract_dir" 2>/dev/null | head -1)
         
-        local container_name="restore_vol_${volume_name}_$(date +%s)_$$"
+        local container_name="chantik_restore_vol_${volume_name}_$(date +%s)_$$"
         
         if [[ -d "$extract_dir/$vol_first_entry" ]] && [[ $(ls -A "$extract_dir" 2>/dev/null | wc -l) -eq 1 ]]; then
             log "📋 Volume data is under single directory: $vol_first_entry"
@@ -1289,7 +1752,7 @@ restore_from_backup() {
                     -v "$volume_name":/volume \
                     alpine sleep infinity 2>/dev/null || {
                         log "⚠️ Failed to create restore container. Trying with different name..."
-                        container_name="restore_vol_${volume_name}_$(date +%s)_$RANDOM"
+                        container_name="chantik_restore_vol_${volume_name}_$(date +%s)_$RANDOM"
                         docker run -d --name "$container_name" \
                             -v "$volume_name":/volume \
                             alpine sleep infinity 2>/dev/null || error_exit "Cannot create restore container"
@@ -1315,7 +1778,7 @@ restore_from_backup() {
                     -v "$volume_name":/volume \
                     alpine sleep infinity 2>/dev/null || {
                         log "⚠️ Failed to create restore container. Trying with different name..."
-                        container_name="restore_vol_${volume_name}_$(date +%s)_$RANDOM"
+                        container_name="chantik_restore_vol_${volume_name}_$(date +%s)_$RANDOM"
                         docker run -d --name "$container_name" \
                             -v "$volume_name":/volume \
                             alpine sleep infinity 2>/dev/null || error_exit "Cannot create restore container"
@@ -1362,6 +1825,15 @@ list_backups() {
         local size=$(human_size $(stat -c%s "$enc_file" 2>/dev/null || echo 0))
         local date=$(echo "$basename" | grep -o '[0-9]\{8\}_[0-9]\{6\}' | sed 's/_/ /' | head -1)
         
+        local backup_type=""
+        if [[ "$basename" == *_full* ]]; then
+            backup_type="FULL"
+        elif [[ "$basename" == *_inc* ]]; then
+            backup_type="INC "
+        else
+            backup_type="LEGACY"
+        fi
+        
         local checksum_file="${enc_file%.enc}.checksums"
         local status=""
         if [[ -f "$checksum_file" ]]; then
@@ -1370,7 +1842,7 @@ list_backups() {
             status="⚠️"
         fi
         
-        printf "  %s %-50s  %-10s  %s\n" "$status" "$basename" "$size" "$date"
+        printf "  %s %s %-55s  %-10s  %s\n" "$status" "$backup_type" "$basename" "$size" "$date"
     done < <(find "$backup_dir" -name "*.enc" -type f 2>/dev/null | sort)
     
     if [[ "$found" == "false" ]]; then
@@ -1390,7 +1862,10 @@ do_backup() {
     BACKUP_START_TIME=$(date +%s)
     local start_date=$(date '+%Y-%m-%d %H:%M:%S')
     
-    log_section "🚀 Starting backup (v$VERSION)"
+    log_section "🕊️ Starting $BRAND_NAME (v$VERSION)"
+    log "💬 $BRAND_TAGLINE"
+    log "🙏 $BRAND_MOTTO"
+    log ""
     
     load_config
     init_tmp
@@ -1409,7 +1884,7 @@ do_backup() {
     log "🐳 Volumes: $volume_count volumes"
     log "💾 Target: $BACKUP_BASE_DIR"
     log "💿 Free space: $free_space_human"
-    log "🔒 Encryption: ${ENCRYPTION_CIPHER^^}"
+    log "🔒 Encryption: ${ENCRYPTION_CIPHER^^} (Chantik Mode)"
     log "🔑 PBKDF2 iterations: ${PBKDF2_ITERATIONS:-600000}"
     if [[ -n "$FIXED_NONCE" ]]; then
         log "🔗 Deduplication: ENABLED (fixed nonce)"
@@ -1419,7 +1894,13 @@ do_backup() {
     log "🗜️ Compression: gzip level $GZIP_LEVEL"
     log "📋 Retention: Daily=${RETENTION_DAILY}, Weekly=${RETENTION_WEEKLY}, Monthly=${RETENTION_MONTHLY}"
     
-    send_ntfy "📅 Time: $start_date\n💻 Host: $hostname\n📁 Source: $SOURCE_DIR\n📊 Size: $source_size_human ($source_files files)\n🐳 Volumes: $volume_count volumes\n💾 Target: $BACKUP_BASE_DIR\n💿 Free space: $free_space_human\n🔒 Encryption: ${ENCRYPTION_CIPHER^^}\n🔑 PBKDF2: ${PBKDF2_ITERATIONS:-600000} iterations\n🔗 Dedup: $([ -n "$FIXED_NONCE" ] && echo "ENABLED" || echo "DISABLED")\n🗜️ Compression: gzip level $GZIP_LEVEL\n📋 Retention: Daily=${RETENTION_DAILY}, Weekly=${RETENTION_WEEKLY}, Monthly=${RETENTION_MONTHLY}" "info"
+    if [[ "$INCREMENTAL_ENABLED" == "true" ]]; then
+        log "🔄 Incremental: ENABLED (full backup every ${FULL_BACKUP_INTERVAL} days)"
+    else
+        log "🔄 Incremental: DISABLED (always full backup)"
+    fi
+    
+    send_ntfy "📅 Time: $start_date\n💻 Host: $hostname\n📁 Source: $SOURCE_DIR\n📊 Size: $source_size_human ($source_files files)\n🐳 Volumes: $volume_count volumes\n💾 Target: $BACKUP_BASE_DIR\n💿 Free space: $free_space_human\n🔒 Encryption: ${ENCRYPTION_CIPHER^^} (Chantik Mode)\n🔑 PBKDF2: ${PBKDF2_ITERATIONS:-600000} iterations\n🔗 Dedup: $([ -n "$FIXED_NONCE" ] && echo "ENABLED" || echo "DISABLED")\n🗜️ Compression: gzip level $GZIP_LEVEL\n📋 Retention: Daily=${RETENTION_DAILY}, Weekly=${RETENTION_WEEKLY}, Monthly=${RETENTION_MONTHLY}\n🔄 Incremental: $([ "$INCREMENTAL_ENABLED" == "true" ] && echo "ENABLED (${FULL_BACKUP_INTERVAL} days)" || echo "DISABLED")" "info"
     acquire_lock
     check_docker
     check_disk_space "$BACKUP_BASE_DIR" 1024
@@ -1430,7 +1911,7 @@ do_backup() {
     mkdir -p "$backup_dir"
     log "📂 Backup directory created: $backup_dir"
 
-    backup_directory "$SOURCE_DIR" "$backup_dir" "digital-independence"
+    backup_directory_incremental "$SOURCE_DIR" "$backup_dir" "digital-independence"
 
     local pids=()
     local failed=0
@@ -1439,7 +1920,7 @@ do_backup() {
     for vol in "${DOCKER_VOLUMES[@]}"; do
         vol_count=$((vol_count + 1))
         log "Processing volume $vol_count of ${#DOCKER_VOLUMES[@]}: $vol"
-        backup_docker_volume "$vol" "$backup_dir" &
+        backup_docker_volume_incremental "$vol" "$backup_dir" &
         pids+=($!)
     done
 
@@ -1489,22 +1970,30 @@ do_backup() {
     local space_used_human=$(human_size $((space_used_mb * 1024 * 1024)))
 
     log_section "✅ Backup completed successfully"
+    log "🕊️ $BRAND_NAME — $BRAND_TAGLINE"
     log "⏱️ Duration: $duration_human"
     log "📦 Archives: $backup_count encrypted files"
     log "💾 Total size: $total_backup_size_human"
     log "📍 Location: $backup_dir"
     log "📝 Log: $LOG_FILE"
+    log "🙏 $BRAND_MOTTO"
 
-    send_ntfy "📅 Completed: $end_date\n⏱️ Duration: $duration_human\n📦 Archives: $backup_count encrypted files\n💾 Total size: $total_backup_size_human\n📁 Source size: $source_size_human ($source_files files)\n🐳 Volumes: $volume_count volumes\n💿 Free space: $free_space_human → $(human_size $((new_free_space_mb * 1024 * 1024))) (used $space_used_human)\n🔒 Verification: ✅ All checksums verified\n🗑️ Retention: Daily=${RETENTION_DAILY}, Weekly=${RETENTION_WEEKLY}, Monthly=${RETENTION_MONTHLY}\n🔗 Deduplication: $([ -n "$FIXED_NONCE" ] && echo "ENABLED" || echo "DISABLED")\n📍 Location: $backup_dir\n📝 Log: $LOG_FILE" "success"
+    local full_count=$(find "$backup_dir" -name "*_full*.enc" 2>/dev/null | wc -l)
+    local inc_count=$(find "$backup_dir" -name "*_inc*.enc" 2>/dev/null | wc -l)
+    
+    send_ntfy "📅 Completed: $end_date\n⏱️ Duration: $duration_human\n📦 Archives: $backup_count encrypted files ($full_count full, $inc_count incremental)\n💾 Total size: $total_backup_size_human\n📁 Source size: $source_size_human ($source_files files)\n🐳 Volumes: $volume_count volumes\n💿 Free space: $free_space_human → $(human_size $((new_free_space_mb * 1024 * 1024))) (used $space_used_human)\n🔒 Verification: ✅ All checksums verified\n🗑️ Retention: Daily=${RETENTION_DAILY}, Weekly=${RETENTION_WEEKLY}, Monthly=${RETENTION_MONTHLY}\n🔗 Deduplication: $([ -n "$FIXED_NONCE" ] && echo "ENABLED" || echo "DISABLED")\n🔄 Incremental: $([ "$INCREMENTAL_ENABLED" == "true" ] && echo "ENABLED (${FULL_BACKUP_INTERVAL} days)" || echo "DISABLED")\n📍 Location: $backup_dir\n📝 Log: $LOG_FILE" "success"
     release_lock
     cleanup_temp
     log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log "🕊️ $BRAND_NAME — From ChaCha Comes Peace of Mind"
 }
 
 run_test() {
     echo ""
-    echo "🔐 Testing Encryption/Decryption System (ChaCha20-Poly1305)"
+    echo "🔐 Testing $BRAND_NAME Encryption/Decryption System"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "💬 $BRAND_TAGLINE"
+    echo "🙏 $BRAND_MOTTO"
     echo ""
     
     if [[ ! -f "$ENCRYPTION_KEY_FILE" ]]; then
@@ -1654,7 +2143,8 @@ run_test() {
     echo "📁 Test files kept in: $TEST_DIR"
     echo "   (Remove with: rm -rf $TEST_DIR)"
     echo ""
-    echo "🔐 Your encryption system (ChaCha20-Poly1305) is ready to use!"
+    echo "🕊️ $BRAND_NAME — $BRAND_TAGLINE"
+    echo "🙏 $BRAND_MOTTO"
     echo ""
     
     if [[ -f "encryption.key.test" ]]; then
@@ -1667,7 +2157,11 @@ run_test() {
 
 show_help() {
     cat <<EOF
-📦 backup.sh - Enterprise-grade backup script (v$VERSION)
+🕊️ $BRAND_NAME v$VERSION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+💬 $BRAND_TAGLINE
+🙏 $BRAND_MOTTO
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 USAGE:
     $SCRIPT_NAME [OPTIONS]
@@ -1677,69 +2171,34 @@ OPTIONS:
     --verify <file>       Verify integrity of a specific backup file
     --verify-all          Verify all backups in the backup directory
     --list                List all available backups
-    --dedup               Run deduplication on the backup directory (requires hardlink or jdupes)
+    --dedup               Run deduplication on the backup directory
     --test                Run encryption/decryption test suite
     --help, -h            Show this help message
 
-CONFIGURATION:
-    All configuration is stored in backup.conf
-    Copy backup.conf.example to backup.conf and modify as needed.
-
-    Required settings:
-        BACKUP_BASE_DIR       - Where backups are stored
-        SOURCE_DIR            - What to backup
-        DOCKER_VOLUMES        - Docker volumes to backup
-        ENCRYPTION_KEY_FILE   - Path to encryption key
-        NTFY_TOPIC            - ntfy.sh topic for notifications
-        NTFY_TOKEN            - ntfy.sh authentication token
-
-    Optional settings:
-        PBKDF2_ITERATIONS     - PBKDF2 iterations for key derivation (default: 600000)
-                                Higher = more secure but slower. Minimum: 100000
-                                Recommended: 600000+ for 2024 standards
-
-        FIXED_SALT_FILE       - Path to file containing 16 hex chars (8 bytes) for fixed salt.
-                                This is converted to a 24‑hex nonce for ChaCha20.
-                                Enables deterministic encryption → identical data yields identical .enc
-                                Allows deduplication via hard links.
-        DEDUP_TOOL            - Tool to use for dedup: "hardlink" or "jdupes" (default: hardlink)
-
 EXAMPLES:
     # Perform a full backup
-    ./backup.sh
+    ./$SCRIPT_NAME
+
+    # Perform incremental backup (if enabled in config)
+    ./$SCRIPT_NAME
 
     # Test encryption/decryption
-    ./backup.sh --test
+    ./$SCRIPT_NAME --test
 
     # List available backups
-    ./backup.sh --list
+    ./$SCRIPT_NAME --list
 
     # Verify a specific backup
-    ./backup.sh --verify /path/to/backup.tar.gz.enc
+    ./$SCRIPT_NAME --verify /path/to/backup.enc
 
     # Verify all backups
-    ./backup.sh --verify-all
+    ./$SCRIPT_NAME --verify-all
 
     # Restore from a specific backup
-    ./backup.sh --restore /path/to/backup.tar.gz.enc
+    ./$SCRIPT_NAME --restore /path/to/backup.enc
 
-    # Run deduplication on backup directory (after backup)
-    ./backup.sh --dedup
-
-SECURITY:
-    - encryption.key should have permissions 600
-    - backup.conf should never be committed to version control
-    - All sensitive data is encrypted with ChaCha20-Poly1305 (AEAD) by default,
-      with automatic fallback to AES-256-CBC if not available.
-    - PBKDF2 iterations configurable (default: 600000)
-    - Supports both ChaCha20 and legacy AES-CBC encryption for backward compatibility.
-    - Fixed nonce (from FIXED_SALT_FILE) enables deduplication; use only if you trust your environment.
-
-NOTES:
-    - Verification uses SHA256 (MD5 removed for security)
-    - Backup rotation now correctly implements daily, weekly, and monthly retention
-    - Notifications sent via ntfy.sh with fallback to custom server
-    - Deduplication reduces storage by hardlinking identical .enc files; requires fixed nonce.
+    # Run deduplication on backup directory
+    ./$SCRIPT_NAME --dedup
 
 EOF
 }
@@ -1753,7 +2212,7 @@ main() {
             ;;
         --restore)
             if [[ -z "${2:-}" ]]; then
-                echo "ERROR: Missing backup file for restore."
+                echo "🕊️ ERROR: Missing backup file for restore."
                 echo "Usage: $SCRIPT_NAME --restore <backup-file>"
                 exit 1
             fi
@@ -1763,7 +2222,7 @@ main() {
             ;;
         --verify)
             if [[ -z "${2:-}" ]]; then
-                echo "ERROR: Missing backup file for verification."
+                echo "🕊️ ERROR: Missing backup file for verification."
                 echo "Usage: $SCRIPT_NAME --verify <backup-file>"
                 exit 1
             fi
@@ -1792,7 +2251,7 @@ main() {
             do_backup
             ;;
         *)
-            echo "ERROR: Unknown option: $1"
+            echo "🕊️ ERROR: Unknown option: $1"
             echo "Use --help for usage information."
             exit 1
             ;;
