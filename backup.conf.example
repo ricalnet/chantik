@@ -34,6 +34,28 @@ NTFY_TOKEN="your-ntfy-token"
 ENCRYPTION_KEY_FILE="/path/to/encryption.key"
 # Generate: openssl rand -base64 32 > encryption.key && chmod 600 encryption.key
 
+# PBKDF2 iterations for key derivation (higher = more secure but slower)
+# Recommended: 600000+ for 2024 security standards
+# Default: 600000
+# PBKDF2_ITERATIONS=600000
+
+# -----------------------------------------------------------------------------
+# DEDUPLICATION - Optional
+# -----------------------------------------------------------------------------
+# To enable deduplication, set a fixed salt file and choose a dedup tool.
+# Fixed salt makes encryption deterministic: identical source data produces
+# identical encrypted files, so hard links can replace duplicates.
+#
+# Generate fixed salt (16 hex chars = 8 bytes):
+#   openssl rand -hex 8 > fixed_salt.txt
+#   chmod 600 fixed_salt.txt
+#
+# FIXED_SALT_FILE="/path/to/fixed_salt.txt"
+
+# Deduplication tool: "hardlink" (default) or "jdupes"
+# Leave empty to skip dedup entirely.
+# DEDUP_TOOL="hardlink"
+
 # -----------------------------------------------------------------------------
 # RETENTION
 # -----------------------------------------------------------------------------

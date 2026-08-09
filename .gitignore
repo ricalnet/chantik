@@ -4,3 +4,4 @@ encryption.key
 *.log
 *.tmp
 .backup_state
+*.txt

@@ -9,6 +9,9 @@
 set -euo pipefail
 IFS=$'\n\t'
 
+VERSION="0.0.9"
+SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
+
 # -----------------------------------------------------------------------------
 # Global Settings
 # -----------------------------------------------------------------------------
@@ -17,7 +20,6 @@ CONFIG_FILE="${SCRIPT_DIR}/backup.conf"
 CONFIG_EXAMPLE="${SCRIPT_DIR}/backup.conf.example"
 LOCK_FILE="${SCRIPT_DIR}/.backup.lock"
 LOG_FILE="${SCRIPT_DIR}/backup.log"
-STATE_FILE="${SCRIPT_DIR}/.backup_state"
 TMP_DIR="${SCRIPT_DIR}/.tmp"
 BACKUP_START_TIME=0
 BACKUP_END_TIME=0
@@ -38,6 +40,10 @@ VERBOSE=false
 BACKUP_PREFIX="backup"
 EXCLUDE_PATTERNS=""
 MAX_BACKUP_SIZE_MB=0
+NTFY_CUSTOM_SERVER=""
+FIXED_SALT_FILE=""
+DEDUP_TOOL="hardlink"
+PBKDF2_ITERATIONS=600000
 
 load_config() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
@@ -54,7 +60,7 @@ load_config() {
 
     source "$CONFIG_FILE"
 
-   local required_vars=(
+    local required_vars=(
         "BACKUP_BASE_DIR"
         "SOURCE_DIR"
         "DOCKER_VOLUMES"
@@ -77,6 +83,30 @@ load_config() {
         printf "  - %s\n" "${missing_vars[@]}"
         echo ""
         echo "Please update $CONFIG_FILE with your values."
+        exit 1
+    fi
+
+    if [[ -n "${PBKDF2_ITERATIONS:-}" ]]; then
+        if [[ ! "$PBKDF2_ITERATIONS" =~ ^[0-9]+$ ]] || [[ "$PBKDF2_ITERATIONS" -lt 100000 ]]; then
+            echo "⚠️ WARNING: PBKDF2_ITERATIONS must be a number >= 100000."
+            echo "   Using default: 600000"
+            PBKDF2_ITERATIONS=600000
+        elif [[ "$PBKDF2_ITERATIONS" -lt 600000 ]]; then
+            echo "⚠️ WARNING: PBKDF2_ITERATIONS=$PBKDF2_ITERATIONS is lower than recommended (600000+)."
+            echo "   Consider increasing for better security."
+        fi
+        log_verbose "PBKDF2 iterations: $PBKDF2_ITERATIONS"
+    else
+        PBKDF2_ITERATIONS=600000
+        log_verbose "Using default PBKDF2 iterations: $PBKDF2_ITERATIONS"
+    fi
+
+    if [[ ! -f "$ENCRYPTION_KEY_FILE" ]]; then
+        echo "ERROR: Encryption key file not found: $ENCRYPTION_KEY_FILE"
+        echo ""
+        echo "Generate one using:"
+        echo "  openssl rand -base64 32 > encryption.key"
+        echo "  chmod 600 encryption.key"
         exit 1
     fi
 
@@ -104,12 +134,56 @@ load_config() {
         exit 1
     fi
 
+    if [[ -n "$FIXED_SALT_FILE" ]]; then
+        if [[ ! -f "$FIXED_SALT_FILE" ]]; then
+            echo "ERROR: Fixed salt file not found: $FIXED_SALT_FILE"
+            echo "Generate a fixed salt (16 hex chars) with:"
+            echo "  openssl rand -hex 8 > fixed_salt.txt"
+            exit 1
+        fi
+        local salt_content
+        salt_content=$(tr -d '\n\r' < "$FIXED_SALT_FILE")
+        if [[ ! "$salt_content" =~ ^[0-9a-fA-F]{16}$ ]]; then
+            echo "ERROR: Fixed salt file must contain exactly 16 hex characters (8 bytes)."
+            echo "Current content: $salt_content"
+            exit 1
+        fi
+        echo "✅ Fixed salt loaded: $salt_content"
+    fi
+
+    if [[ -n "$DEDUP_TOOL" ]]; then
+        if ! command -v "$DEDUP_TOOL" &> /dev/null; then
+            echo "⚠️ WARNING: Deduplication tool '$DEDUP_TOOL' not found. Dedup will be skipped."
+            echo "   Install with: apt install hardlink  or  brew install hardlink"
+            echo "   Or set DEDUP_TOOL='' in config to disable."
+            DEDUP_TOOL=""
+        fi
+    fi
+
+    if [[ ! "$GZIP_LEVEL" =~ ^[1-9]$ ]]; then
+        echo "⚠️ WARNING: Invalid GZIP_LEVEL '$GZIP_LEVEL'. Must be 1-9. Using default 6."
+        GZIP_LEVEL=6
+    fi
+
+    local required_tools=("openssl" "gzip" "tar" "curl" "sha256sum")
+    local missing_tools=()
+    for tool in "${required_tools[@]}"; do
+        if ! command -v "$tool" &> /dev/null; then
+            missing_tools+=("$tool")
+        fi
+    done
+    if [[ ${#missing_tools[@]} -gt 0 ]]; then
+        echo "ERROR: Required tools not found: ${missing_tools[*]}"
+        echo "Please install them and try again."
+        exit 1
+    fi
+
     echo "✅ Configuration loaded successfully from: $CONFIG_FILE"
 }
 
 init_tmp() {
     mkdir -p "$TMP_DIR"
-    chmod 700 "$TMP_DIR"
+    chmod 700 "$TMP_DIR" 2>/dev/null || true
     find "$TMP_DIR" -type f -mtime +1 -delete 2>/dev/null || true
 }
 
@@ -143,7 +217,7 @@ send_ntfy() {
         return 0
     fi
     
-    log_verbose "Sending notification (status: $status)"
+    log_verbose "Sending notification (status: $status, topic: $NTFY_TOPIC)"
     
     local priority="3"
     local tags="information_source"
@@ -155,7 +229,7 @@ send_ntfy() {
     
     {
         local servers=(
-            "https://notify.ricalnet.my.id"
+            "https://ntfy.sh"
             "${NTFY_CUSTOM_SERVER:-}"
         )
         
@@ -164,8 +238,14 @@ send_ntfy() {
             [[ -z "$server" ]] && continue
             log_verbose "Trying $server..."
             
-            local response_file="${TMP_DIR}/ntfy_response_$$"
-            local http_code_file="${TMP_DIR}/ntfy_http_code_$$"
+            local response_file
+            if ! response_file=$(mktemp -p "$TMP_DIR" ntfy_response_XXXXXX 2>/dev/null); then
+                response_file="${TMP_DIR}/ntfy_response_$$_$RANDOM"
+            fi
+            local http_code_file
+            if ! http_code_file=$(mktemp -p "$TMP_DIR" ntfy_http_XXXXXX 2>/dev/null); then
+                http_code_file="${TMP_DIR}/ntfy_http_$$_$RANDOM"
+            fi
             
             local http_code=$(curl -s -w "%{http_code}" -o "$response_file" \
                 --max-time 10 \
@@ -253,6 +333,7 @@ check_backup_size() {
     if [[ "$MAX_BACKUP_SIZE_MB" -gt 0 ]]; then
         local size_mb
         size_mb=$(du -sm "$backup_dir" 2>/dev/null | awk '{print $1}' || echo 0)
+        log "📊 Backup size: ${size_mb}MB"
         if (( size_mb > MAX_BACKUP_SIZE_MB )); then
             error_exit "Backup size ${size_mb}MB exceeds limit of ${MAX_BACKUP_SIZE_MB}MB"
         fi
@@ -291,9 +372,196 @@ release_lock() {
 }
 
 cleanup_temp() {
-    rm -f "$STATE_FILE" "${TMP_DIR}/backup_rotate_$$" "${TMP_DIR}/backup_rotate_$$.grouped" 2>/dev/null || true
-    rm -f "${TMP_DIR}/ntfy_response_$$" "${TMP_DIR}/ntfy_http_code_$$" 2>/dev/null || true
+    find "$TMP_DIR" -type f -name "backup_rotate_*" -delete 2>/dev/null || true
+    find "$TMP_DIR" -type f -name "ntfy_response_*" -delete 2>/dev/null || true
+    find "$TMP_DIR" -type f -name "ntfy_http_*" -delete 2>/dev/null || true
+    find "$TMP_DIR" -type d -name "verify_test_*" -exec rm -rf {} + 2>/dev/null || true
+    find "$TMP_DIR" -type d -name "restore_*" -exec rm -rf {} + 2>/dev/null || true
     find "$TMP_DIR" -type f -mtime +1 -delete 2>/dev/null || true
+}
+
+encrypt_file() {
+    local infile="$1"
+    local outfile="$2"
+    if [[ ! -f "$ENCRYPTION_KEY_FILE" ]]; then
+        error_exit "Encryption key file not found: $ENCRYPTION_KEY_FILE"
+    fi
+    
+    local openssl_opts=()
+    openssl_opts+=("-pbkdf2" "-iter" "${PBKDF2_ITERATIONS:-600000}")
+    
+    if [[ -n "$FIXED_SALT_FILE" ]] && [[ -f "$FIXED_SALT_FILE" ]]; then
+        local salt_hex
+        salt_hex=$(tr -d '\n\r' < "$FIXED_SALT_FILE")
+        openssl_opts+=("-S" "$salt_hex")
+        log_verbose "Using fixed salt for deterministic encryption (deduplication enabled)"
+    else
+        openssl_opts+=("-salt")
+        log_verbose "Using random salt (deduplication disabled)"
+    fi
+    
+    log_verbose "Encrypting with openssl: ${openssl_opts[*]} (iterations: ${PBKDF2_ITERATIONS:-600000})"
+    if openssl enc -aes-256-cbc "${openssl_opts[@]}" -in "$infile" -out "$outfile" -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
+        log_verbose "✅ Encryption successful"
+        return 0
+    fi
+    
+    log_verbose "pbkdf2 failed, trying legacy method..."
+    local legacy_opts=()
+    if [[ -n "$FIXED_SALT_FILE" ]] && [[ -f "$FIXED_SALT_FILE" ]]; then
+        local salt_hex
+        salt_hex=$(tr -d '\n\r' < "$FIXED_SALT_FILE")
+        legacy_opts+=("-S" "$salt_hex")
+    else
+        legacy_opts+=("-salt")
+    fi
+    if openssl enc -aes-256-cbc "${legacy_opts[@]}" -in "$infile" -out "$outfile" -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
+        log_verbose "✅ Encryption successful (legacy method)"
+        return 0
+    fi
+    
+    error_exit "OpenSSL encryption failed for $infile (both methods)"
+}
+
+decrypt_file() {
+    local infile="$1"
+    local outfile="$2"
+    if [[ ! -f "$ENCRYPTION_KEY_FILE" ]]; then
+        error_exit "Encryption key file not found: $ENCRYPTION_KEY_FILE"
+    fi
+    
+    log_verbose "Trying decryption with pbkdf2 (iterations: ${PBKDF2_ITERATIONS:-600000})..."
+    if openssl enc -d -aes-256-cbc -pbkdf2 -iter "${PBKDF2_ITERATIONS:-600000}" \
+        -in "$infile" -out "$outfile" -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
+        log_verbose "✅ Decryption successful (pbkdf2 method, ${PBKDF2_ITERATIONS:-600000} iterations)"
+        return 0
+    fi
+    
+    log_verbose "pbkdf2 with ${PBKDF2_ITERATIONS:-600000} failed, trying with 100000 iterations..."
+    if openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
+        -in "$infile" -out "$outfile" -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
+        log_verbose "✅ Decryption successful (pbkdf2 method, 100000 iterations - legacy)"
+        return 0
+    fi
+    
+    log_verbose "pbkdf2 failed, trying legacy method..."
+    if openssl enc -d -aes-256-cbc -in "$infile" -out "$outfile" -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
+        log_verbose "✅ Decryption successful (legacy method)"
+        return 0
+    fi
+    
+    error_exit "OpenSSL decryption failed for $infile (all methods)"
+}
+
+decrypt_file() {
+    local infile="$1"
+    local outfile="$2"
+    if [[ ! -f "$ENCRYPTION_KEY_FILE" ]]; then
+        error_exit "Encryption key file not found: $ENCRYPTION_KEY_FILE"
+    fi
+    
+    local file_header=$(dd if="$infile" bs=1 count=16 2>/dev/null | od -An -tx1 | tr -d ' ')
+    log_verbose "File header: $file_header"
+    
+    if [[ "$file_header" == "53616c7465645f5f"* ]]; then
+        log_verbose "File has standard OpenSSL header (Salted__)"
+    else
+        log_verbose "File does NOT have standard OpenSSL header. Trying alternative methods..."
+    fi
+    
+    log_verbose "Trying decryption with pbkdf2 (iterations: ${PBKDF2_ITERATIONS:-600000})..."
+    if openssl enc -d -aes-256-cbc -pbkdf2 -iter "${PBKDF2_ITERATIONS:-600000}" \
+        -in "$infile" -out "$outfile" -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
+        log_verbose "✅ Decryption successful (pbkdf2 method, ${PBKDF2_ITERATIONS:-600000} iterations)"
+        return 0
+    fi
+    
+    log_verbose "Trying decryption with pbkdf2 (iterations: 100000)..."
+    if openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
+        -in "$infile" -out "$outfile" -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
+        log_verbose "✅ Decryption successful (pbkdf2 method, 100000 iterations - legacy)"
+        return 0
+    fi
+    
+    log_verbose "Trying decryption with pbkdf2 (iterations: 10000)..."
+    if openssl enc -d -aes-256-cbc -pbkdf2 -iter 10000 \
+        -in "$infile" -out "$outfile" -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
+        log_verbose "✅ Decryption successful (pbkdf2 method, 10000 iterations)"
+        return 0
+    fi
+    
+    log_verbose "Trying decryption with pbkdf2 (iterations: 1000)..."
+    if openssl enc -d -aes-256-cbc -pbkdf2 -iter 1000 \
+        -in "$infile" -out "$outfile" -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
+        log_verbose "✅ Decryption successful (pbkdf2 method, 1000 iterations)"
+        return 0
+    fi
+    
+    log_verbose "Trying decryption with legacy method (no pbkdf2)..."
+    if openssl enc -d -aes-256-cbc -in "$infile" -out "$outfile" -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
+        log_verbose "✅ Decryption successful (legacy method)"
+        return 0
+    fi
+    
+    if [[ -n "$FIXED_SALT_FILE" ]] && [[ -f "$FIXED_SALT_FILE" ]]; then
+        local salt_hex
+        salt_hex=$(tr -d '\n\r' < "$FIXED_SALT_FILE")
+        
+        log_verbose "Trying decryption with fixed salt: $salt_hex (pbkdf2)..."
+        if openssl enc -d -aes-256-cbc -pbkdf2 -iter "${PBKDF2_ITERATIONS:-600000}" -S "$salt_hex" \
+            -in "$infile" -out "$outfile" -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
+            log_verbose "✅ Decryption successful (fixed salt + pbkdf2)"
+            return 0
+        fi
+        
+        log_verbose "Trying decryption with fixed salt: $salt_hex (legacy)..."
+        if openssl enc -d -aes-256-cbc -S "$salt_hex" \
+            -in "$infile" -out "$outfile" -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
+            log_verbose "✅ Decryption successful (fixed salt + legacy)"
+            return 0
+        fi
+    fi
+    
+    log_verbose "Trying decryption with explicit -salt flag..."
+    if openssl enc -d -aes-256-cbc -salt \
+        -in "$infile" -out "$outfile" -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
+        log_verbose "✅ Decryption successful (with -salt flag)"
+        return 0
+    fi
+    
+    log_verbose "Trying various algorithms..."
+    for algo in aes-256-cfb aes-256-ofb aes-192-cbc aes-128-cbc; do
+        if openssl enc -d -$algo -pbkdf2 -iter "${PBKDF2_ITERATIONS:-600000}" \
+            -in "$infile" -out "$outfile" -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
+            log_verbose "✅ Decryption successful (algorithm: $algo)"
+            return 0
+        fi
+    done
+    
+    log_verbose "Trying decryption assuming no compression..."
+    if openssl enc -d -aes-256-cbc -pbkdf2 -iter "${PBKDF2_ITERATIONS:-600000}" \
+        -in "$infile" -out "${outfile}.raw" -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
+        if file "${outfile}.raw" | grep -q "gzip compressed"; then
+            mv "${outfile}.raw" "$outfile"
+            log_verbose "✅ Decryption successful (raw output is gzip)"
+            return 0
+        fi
+        rm -f "${outfile}.raw" 2>/dev/null
+    fi
+    
+    error_exit "OpenSSL decryption failed for $infile (all methods)"
+}
+
+fix_encrypted_filename() {
+    local file="$1"
+    if [[ "$file" == *.enc.enc ]]; then
+        local fixed_file="${file%.enc}"
+        log_verbose "Fixing double .enc extension: $file -> $fixed_file"
+        mv "$file" "$fixed_file" 2>/dev/null || true
+        echo "$fixed_file"
+    else
+        echo "$file"
+    fi
 }
 
 backup_directory() {
@@ -312,9 +580,9 @@ backup_directory() {
 
     local exclude_opts=()
     if [[ -n "$EXCLUDE_PATTERNS" ]]; then
-        for pattern in $EXCLUDE_PATTERNS; do
-            exclude_opts+=("--exclude=$pattern")
-        done
+        echo "$EXCLUDE_PATTERNS" | grep -q '[^a-zA-Z0-9_*./ -]' && {
+            echo "⚠️ WARNING: EXCLUDE_PATTERNS contains unusual characters: $EXCLUDE_PATTERNS"
+        }
     fi
 
     tar -cf "$tar_file" -C "$(dirname "$src")" "${exclude_opts[@]}" "$(basename "$src")" \
@@ -331,10 +599,9 @@ backup_directory() {
     generate_checksums "$gz_file"
     encrypt_file "$gz_file" "$enc_file"
     if [[ -f "$enc_file" ]]; then
+        sha256sum "$enc_file" | awk '{print $1}' | sed "s/^/SHA256: /" > "${enc_file}.enc.checksums"
         rm -f "$gz_file"
         log "✅ Encrypted backup created: $(basename "$enc_file")"
-    else
-        error_exit "Encryption failed for $gz_file"
     fi
 }
 
@@ -352,35 +619,52 @@ backup_docker_volume() {
     fi
 
     local container_name="backup_vol_${volume}_$(date +%s)"
-    docker run --rm --name "$container_name" \
+    log_verbose "Creating container: $container_name"
+    
+    if ! docker run --rm --name "$container_name" \
         -v "$volume":/volume \
         -v "$dest_dir":/backup \
         "$DOCKER_IMAGE" \
         tar -cf "/backup/${volume}.tar" -C /volume . \
-        --preserve-permissions --same-owner 2>/dev/null || \
-    docker run --rm --name "$container_name" \
-        -v "$volume":/volume \
-        -v "$dest_dir":/backup \
-        "$DOCKER_IMAGE" \
-        tar -cf "/backup/${volume}.tar" -C /volume .
+        --preserve-permissions --same-owner 2>/dev/null; then
+        
+        log_verbose "First tar attempt failed, trying without permissions..."
+        docker run --rm --name "$container_name" \
+            -v "$volume":/volume \
+            -v "$dest_dir":/backup \
+            alpine \
+            tar -cf "/backup/${volume}.tar" -C /volume . 2>/dev/null || {
+                error_exit "Failed to create tar for volume $volume"
+            }
+    fi
 
     if [[ ! -f "${dest_dir}/${volume}.tar" ]]; then
-        error_exit "Failed to create tar for volume $volume"
+        error_exit "Tar file not created for volume $volume"
     fi
 
     mv "${dest_dir}/${volume}.tar" "$tar_file"
+    
+    if ! tar -tf "$tar_file" &>/dev/null; then
+        error_exit "Tar file is corrupted or empty: $tar_file"
+    fi
 
-    log "Compressing $tar_file"
+    log "Compressing $tar_file (gzip level $GZIP_LEVEL)"
     gzip -v -$GZIP_LEVEL "$tar_file"
-    if [[ ! -f "$gz_file" ]]; then
+    if [[ ! -f "$gz_file" ]] || [[ ! -s "$gz_file" ]]; then
         error_exit "Compression failed for $tar_file"
     fi
 
     generate_checksums "$gz_file"
+    
+    log_verbose "Encrypting volume backup..."
     encrypt_file "$gz_file" "$enc_file"
-    if [[ -f "$enc_file" ]]; then
+    
+    if [[ -f "$enc_file" ]] && [[ -s "$enc_file" ]]; then
+        sha256sum "$enc_file" | awk '{print $1}' | sed "s/^/SHA256: /" > "${enc_file}.enc.checksums"
+        log_verbose "Created encrypted checksum: ${enc_file}.enc.checksums"
+        
         rm -f "$gz_file"
-        log "✅ Encrypted volume backup created: $(basename "$enc_file")"
+        log "✅ Encrypted volume backup created: $(basename "$enc_file") ($(human_size $(stat -c%s "$enc_file" 2>/dev/null || echo 0)))"
     else
         error_exit "Encryption failed for $gz_file"
     fi
@@ -390,45 +674,101 @@ generate_checksums() {
     local file="$1"
     local checksum_file="${file}.checksums"
     {
-        md5sum "$file" | awk '{print $1}' | sed "s/^/MD5: /"
         sha256sum "$file" | awk '{print $1}' | sed "s/^/SHA256: /"
     } > "$checksum_file"
     log_verbose "Checksums generated for $(basename "$file")"
 }
 
-encrypt_file() {
-    local infile="$1"
-    local outfile="$2"
-    if [[ ! -f "$ENCRYPTION_KEY_FILE" ]]; then
-        error_exit "Encryption key file not found: $ENCRYPTION_KEY_FILE"
-    fi
-    openssl enc -aes-256-cbc -salt -in "$infile" -out "$outfile" -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null
-    if [[ $? -ne 0 ]]; then
-        error_exit "OpenSSL encryption failed for $infile"
-    fi
-}
-
-decrypt_file() {
-    local infile="$1"
-    local outfile="$2"
-    if [[ ! -f "$ENCRYPTION_KEY_FILE" ]]; then
-        error_exit "Encryption key file not found: $ENCRYPTION_KEY_FILE"
-    fi
-    openssl enc -d -aes-256-cbc -in "$infile" -out "$outfile" -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null
-    if [[ $? -ne 0 ]]; then
-        error_exit "OpenSSL decryption failed for $infile"
-    fi
-}
-
 verify_backup() {
     local enc_file="$1"
-    local checksum_file="${enc_file%.enc}.checksums"
-    if [[ ! -f "$checksum_file" ]]; then
-        log "⚠️ WARNING: Checksum file missing for $(basename "$enc_file")"
+    
+    if [[ ! -f "$enc_file" ]] || [[ ! -s "$enc_file" ]]; then
+        log "❌ Encrypted file missing or empty: $(basename "$enc_file")"
         return 1
     fi
-    log_verbose "Checksum file exists for $(basename "$enc_file")"
+    
+    local checksum_file="${enc_file%.enc}.checksums"
+    local enc_checksum_file="${enc_file}.enc.checksums"
+    
+    if [[ -f "$enc_checksum_file" ]]; then
+        local stored_sha=$(grep '^SHA256:' "$enc_checksum_file" 2>/dev/null | awk '{print $2}')
+        local current_sha=$(sha256sum "$enc_file" 2>/dev/null | awk '{print $1}')
+        if [[ "$stored_sha" != "$current_sha" ]]; then
+            log "❌ SHA256 MISMATCH for $(basename "$enc_file")"
+            return 1
+        fi
+        log "✅ SHA256 verified for $(basename "$enc_file")"
+        return 0
+    fi
+    
+    log_verbose "No encrypted checksum found, using fallback verification for $(basename "$enc_file")"
+    
+    if [[ ! -f "$checksum_file" ]]; then
+        log "⚠️ WARNING: No checksum file found for $(basename "$enc_file")"
+        local tmp_dir
+        tmp_dir=$(mktemp -d -p "$TMP_DIR" verify_decrypt_XXXXXX 2>/dev/null || 
+                  echo "${TMP_DIR}/verify_decrypt_$$_$RANDOM")
+        mkdir -p "$tmp_dir" 2>/dev/null
+        local decrypted_file="${tmp_dir}/$(basename "${enc_file%.enc}")"
+        
+        if decrypt_file "$enc_file" "$decrypted_file" 2>/dev/null; then
+            log "✅ Decryption successful for $(basename "$enc_file") (no checksum available)"
+            rm -rf "$tmp_dir" 2>/dev/null
+            return 0
+        else
+            log "❌ Decryption failed for $(basename "$enc_file")"
+            rm -rf "$tmp_dir" 2>/dev/null
+            return 1
+        fi
+    fi
+    
+    local tmp_dir
+    tmp_dir=$(mktemp -d -p "$TMP_DIR" verify_decrypt_XXXXXX 2>/dev/null || 
+              echo "${TMP_DIR}/verify_decrypt_$$_$RANDOM")
+    mkdir -p "$tmp_dir" 2>/dev/null
+    local decrypted_file="${tmp_dir}/$(basename "${enc_file%.enc}")"
+    
+    if ! decrypt_file "$enc_file" "$decrypted_file" 2>/dev/null; then
+        log "❌ Decryption failed for $(basename "$enc_file")"
+        rm -rf "$tmp_dir" 2>/dev/null
+        return 1
+    fi
+    
+    local stored_sha=$(grep '^SHA256:' "$checksum_file" 2>/dev/null | awk '{print $2}')
+    local current_sha=$(sha256sum "$decrypted_file" 2>/dev/null | awk '{print $1}')
+    
+    rm -rf "$tmp_dir" 2>/dev/null
+    
+    if [[ "$stored_sha" != "$current_sha" ]]; then
+        log "❌ SHA256 MISMATCH for $(basename "$enc_file")"
+        return 1
+    fi
+    
+    log "✅ SHA256 verified for $(basename "$enc_file")"
     return 0
+}
+
+get_backup_age_days() {
+    local filepath="$1"
+    local filename=$(basename "$filepath")
+    local date_str=$(echo "$filename" | grep -oE '[0-9]{8}_[0-9]{6}' | head -1)
+    if [[ -z "$date_str" ]]; then
+        local mtime=$(stat -c %Y "$filepath" 2>/dev/null || stat -f %m "$filepath" 2>/dev/null)
+        if [[ -n "$mtime" ]]; then
+            local now=$(date +%s)
+            echo $(( (now - mtime) / 86400 ))
+        else
+            echo 9999
+        fi
+    else
+        local file_epoch=$(date -d "${date_str:0:8} ${date_str:9:2}:${date_str:11:2}:${date_str:13:2}" +%s 2>/dev/null || echo 0)
+        if [[ $file_epoch -eq 0 ]]; then
+            echo 9999
+        else
+            local now=$(date +%s)
+            echo $(( (now - file_epoch) / 86400 ))
+        fi
+    fi
 }
 
 rotate_backups() {
@@ -438,46 +778,211 @@ rotate_backups() {
     local file_count=$(find "$backup_dir" -maxdepth 1 -name "*.enc" -type f 2>/dev/null | wc -l)
     log_verbose "Found $file_count backup files in $backup_dir"
 
-    if timeout 60 bash -c "
-        tmp_file=\"${TMP_DIR}/backup_rotate_$$\"
-        find \"$backup_dir\" -maxdepth 1 -name \"*.enc\" -type f > \"\$tmp_file\" 2>/dev/null
+    local daily="$RETENTION_DAILY"
+    local weekly="$RETENTION_WEEKLY"
+    local monthly="$RETENTION_MONTHLY"
 
-        while IFS= read -r encfile; do
-            basename=\$(basename \"\$encfile\")
-            type=\$(echo \"\$basename\" | sed -E 's/_[0-9]{8}_[0-9]{6}\.tar\.gz\.enc\$//')
-            echo \"\$type|\$encfile\"
-        done < \"\$tmp_file\" 2>/dev/null | sort > \"\${tmp_file}.grouped\" 2>/dev/null
+    local tmp_file
+    if ! tmp_file=$(mktemp -p "$TMP_DIR" backup_rotate_XXXXXX 2>/dev/null); then
+        tmp_file="${TMP_DIR}/backup_rotate_$$_$RANDOM"
+    fi
+    local grouped_file="${tmp_file}.grouped"
 
-        keep_files_per_type() {
-            local type=\"\$1\"
-            local max_keep=\"\$2\"
-            local count=0
-            grep \"^\${type}|\" \"\${tmp_file}.grouped\" 2>/dev/null | cut -d'|' -f2 | sort -r | while read -r f; do
-                count=\$((count + 1))
-                if (( count > max_keep )); then
-                    echo \"Deleting old backup: \$f (exceeds retention of \$max_keep for type \$type)\"
-                    rm -f \"\$f\" 2>/dev/null
-                    rm -f \"\${f%.enc}.checksums\" 2>/dev/null
+    find "$backup_dir" -maxdepth 1 -name "*.enc" -type f > "$tmp_file" 2>/dev/null
+
+    while IFS= read -r encfile; do
+        basename=$(basename "$encfile")
+        type=$(echo "$basename" | sed -E 's/_[0-9]{8}_[0-9]{6}\.tar\.gz\.enc$//')
+        if [[ "$type" == "$basename" ]]; then
+            type=$(echo "$basename" | sed -E 's/\.tar\.gz\.enc$//')
+        fi
+        echo "$type|$encfile"
+    done < "$tmp_file" 2>/dev/null | sort > "$grouped_file" 2>/dev/null
+
+    local types=$(cut -d'|' -f1 "$grouped_file" 2>/dev/null | sort -u)
+
+    for type in $types; do
+        log_verbose "Processing type: $type"
+        
+        local files=()
+        while IFS= read -r f; do
+            files+=("$f")
+        done < <(grep "^${type}|" "$grouped_file" 2>/dev/null | cut -d'|' -f2 | sort)
+
+        local weekly_kept=()
+        local monthly_kept=()
+
+        for f in "${files[@]}"; do
+            age=$(get_backup_age_days "$f")
+            
+            if (( age <= daily )); then
+                log_verbose "Keeping (daily): $f (age $age days)"
+                continue
+            fi
+            
+            if (( age <= 7 * weekly )); then
+                week_num=$(( (age - 1) / 7 ))
+                local already_kept=false
+                for kept in "${weekly_kept[@]}"; do
+                    if [[ "$kept" == "w$week_num" ]]; then
+                        already_kept=true
+                        break
+                    fi
+                done
+                if [[ "$already_kept" == "false" ]]; then
+                    weekly_kept+=("w$week_num")
+                    log_verbose "Keeping (weekly): $f (age $age days, week $week_num)"
+                    continue
+                else
+                    log_verbose "Skipping (weekly duplicate): $f (age $age days, week $week_num)"
                 fi
-            done
-        }
-
-        keep_files_per_type \"digital-independence\" \"$RETENTION_DAILY\"
-        for vol in ${DOCKER_VOLUMES[@]}; do
-            keep_files_per_type \"volume_\${vol}\" \"$RETENTION_DAILY\"
+            fi
+            
+            if (( age <= 30 * monthly )); then
+                month_num=$(( (age - 1) / 30 ))
+                local already_kept=false
+                for kept in "${monthly_kept[@]}"; do
+                    if [[ "$kept" == "m$month_num" ]]; then
+                        already_kept=true
+                        break
+                    fi
+                done
+                if [[ "$already_kept" == "false" ]]; then
+                    monthly_kept+=("m$month_num")
+                    log_verbose "Keeping (monthly): $f (age $age days, month $month_num)"
+                    continue
+                else
+                    log_verbose "Skipping (monthly duplicate): $f (age $age days, month $month_num)"
+                fi
+            fi
+            
+            log "Deleting old backup: $f (age $age days, exceeds all retention)"
+            rm -f "$f" 2>/dev/null
+            rm -f "${f%.enc}.checksums" 2>/dev/null
         done
+    done
 
-        rm -f \"\$tmp_file\" \"\${tmp_file}.grouped\" 2>/dev/null
-    " 2>&1 | while IFS= read -r line; do log "ROTATE: $line"; done; then
-        log "✅ Rotation completed successfully"
+    rm -f "$tmp_file" "$grouped_file" 2>/dev/null
+    log "✅ Rotation completed"
+}
+
+verify_backup_integrity() {
+    local enc_file="$1"
+    local result=0
+    
+    echo ""
+    echo "🔍 Verifying: $(basename "$enc_file")"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    
+    if [[ ! -f "$enc_file" ]]; then
+        echo "❌ File not found: $enc_file"
+        return 1
+    fi
+    
+    local file_size=$(stat -c%s "$enc_file" 2>/dev/null || echo 0)
+    if [[ $file_size -eq 0 ]]; then
+        echo "❌ File is empty (0 bytes)"
+        return 1
+    fi
+    echo "📦 File size: $(human_size "$file_size")"
+    
+    local checksum_file="${enc_file%.enc}.checksums"
+    if [[ ! -f "$checksum_file" ]]; then
+        echo "⚠️  WARNING: Checksum file not found: $(basename "$checksum_file")"
+        echo "   Cannot verify integrity without checksums."
+        result=1
     else
-        local exit_code=$?
-        if [[ $exit_code -eq 124 ]]; then
-            log "⚠️ WARNING: Rotation timed out after 60 seconds"
+        local stored_sha=$(grep '^SHA256:' "$checksum_file" 2>/dev/null | awk '{print $2}')
+        
+        if [[ -z "$stored_sha" ]]; then
+            echo "⚠️  WARNING: Invalid checksum file format (missing SHA256)"
+            result=1
         else
-            log "⚠️ WARNING: Rotation had errors (exit code: $exit_code)"
+            echo "🔐 Calculating current SHA256..."
+            local current_sha=$(sha256sum "$enc_file" 2>/dev/null | awk '{print $1}')
+            
+            if [[ "$stored_sha" == "$current_sha" ]]; then
+                echo "✅ SHA256: MATCH"
+            else
+                echo "❌ SHA256: MISMATCH"
+                echo "   Stored:  $stored_sha"
+                echo "   Current: $current_sha"
+                result=1
+            fi
         fi
     fi
+    
+    echo "🔐 Testing decryption..."
+    local test_dir
+    if ! test_dir=$(mktemp -d -p "$TMP_DIR" verify_test_XXXXXX 2>/dev/null); then
+        test_dir="${TMP_DIR}/verify_test_$$_$RANDOM"
+    fi
+    mkdir -p "$test_dir" 2>/dev/null || true
+    local test_output="${test_dir}/test_decrypt.gz"
+    
+    if decrypt_file "$enc_file" "$test_output" 2>/dev/null; then
+        if [[ -f "$test_output" ]] && [[ -s "$test_output" ]]; then
+            echo "✅ Decryption: SUCCESS"
+            if gzip -t "$test_output" 2>/dev/null; then
+                echo "✅ Gzip:      VALID"
+            else
+                echo "⚠️  Gzip:      INVALID or corrupt after decryption"
+                result=1
+            fi
+        else
+            echo "❌ Decryption: FAILED (output empty)"
+            result=1
+        fi
+    else
+        echo "❌ Decryption: FAILED"
+        result=1
+    fi
+    
+    rm -rf "$test_dir" 2>/dev/null || true
+    
+    if [[ $result -eq 0 ]]; then
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "✅ VERIFICATION PASSED: $(basename "$enc_file") is intact"
+    else
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "❌ VERIFICATION FAILED: $(basename "$enc_file") has issues"
+    fi
+    echo ""
+    
+    return $result
+}
+
+verify_all_backups() {
+    local backup_dir="$1"
+    local failed=0
+    local total=0
+    
+    echo ""
+    echo "📦 Verifying all backups in: $backup_dir"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    
+    while IFS= read -r enc_file; do
+        total=$((total + 1))
+        if ! verify_backup_integrity "$enc_file"; then
+            failed=$((failed + 1))
+        fi
+    done < <(find "$backup_dir" -name "*.enc" -type f 2>/dev/null | sort)
+    
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "📊 SUMMARY: $total backups verified, $failed failed"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    
+    if [[ $failed -eq 0 ]] && [[ $total -gt 0 ]]; then
+        echo "✅ All backups are intact!"
+    elif [[ $total -eq 0 ]]; then
+        echo "⚠️  No backups found in: $backup_dir"
+    else
+        echo "⚠️  $failed backup(s) failed verification"
+    fi
+    echo ""
+    
+    return $failed
 }
 
 restore_from_backup() {
@@ -516,12 +1021,12 @@ restore_from_backup() {
     local checksum_file="${enc_file%.enc}.checksums"
     if [[ -f "$checksum_file" ]]; then
         log "Verifying checksum of decrypted file..."
-        local md5_original
-        md5_original=$(grep '^MD5:' "$checksum_file" | awk '{print $2}')
-        local md5_current
-        md5_current=$(md5sum "$decrypted_file" | awk '{print $1}')
-        if [[ "$md5_original" != "$md5_current" ]]; then
-            error_exit "MD5 checksum mismatch! Restore aborted."
+        local sha_original
+        sha_original=$(grep '^SHA256:' "$checksum_file" | awk '{print $2}')
+        local sha_current
+        sha_current=$(sha256sum "$decrypted_file" | awk '{print $1}')
+        if [[ "$sha_original" != "$sha_current" ]]; then
+            error_exit "SHA256 checksum mismatch! Restore aborted."
         else
             log "✅ Checksum verification passed."
         fi
@@ -530,7 +1035,7 @@ restore_from_backup() {
     fi
 
     log "Decompressing $(basename "$decrypted_file")"
-    gunzip -v "$decrypted_file" || error_exit "Gunzip failed"
+    gzip -d "$decrypted_file" 2>/dev/null || error_exit "Gunzip failed"
     local tar_file="${decrypted_file%.gz}"
     if [[ ! -f "$tar_file" ]]; then
         error_exit "Decompression failed: $(basename "$tar_file") not found"
@@ -538,7 +1043,6 @@ restore_from_backup() {
 
     if [[ "$type" == "digital-independence" ]]; then
         local dest_dir="$SOURCE_DIR"
-        
         dest_dir="${dest_dir%/}"
         
         log "Restoring directory backup to $dest_dir"
@@ -643,31 +1147,67 @@ restore_from_backup() {
         
         local extract_dir="${tmp_dir}/extract_vol"
         mkdir -p "$extract_dir"
-        tar -xf "$tar_file" -C "$extract_dir" --preserve-permissions --same-owner
+        
+        tar -xf "$tar_file" -C "$extract_dir" --no-same-owner --no-same-permissions 2>/dev/null || \
+            tar -xf "$tar_file" -C "$extract_dir" --no-same-owner
         
         local vol_first_entry=$(ls -A "$extract_dir" 2>/dev/null | head -1)
+        
+        local container_name="restore_vol_${volume_name}_$(date +%s)_$$"
         
         if [[ -d "$extract_dir/$vol_first_entry" ]] && [[ $(ls -A "$extract_dir" 2>/dev/null | wc -l) -eq 1 ]]; then
             log "Volume data is under single directory: $vol_first_entry"
             
-            local container_name="restore_vol_${volume_name}_$(date +%s)"
-            docker run --rm --name "$container_name" \
+            docker run -d --name "$container_name" \
                 -v "$volume_name":/volume \
-                -v "$extract_dir":/restore \
                 "$DOCKER_IMAGE" \
-                sh -c "rm -rf /volume/* && cp -a /restore/$vol_first_entry/. /volume/" || \
-                error_exit "Failed to restore volume $volume_name"
+                timeout 30 sleep infinity 2>/dev/null || \
+                docker run -d --name "$container_name" \
+                    -v "$volume_name":/volume \
+                    alpine sleep infinity 2>/dev/null || {
+                        log "⚠️ Failed to create restore container. Trying with different name..."
+                        container_name="restore_vol_${volume_name}_$(date +%s)_$RANDOM"
+                        docker run -d --name "$container_name" \
+                            -v "$volume_name":/volume \
+                            alpine sleep infinity 2>/dev/null || error_exit "Cannot create restore container"
+                    }
+            
+            sleep 2
+            
+            docker cp "$extract_dir/$vol_first_entry/." "$container_name:/volume/" 2>/dev/null || \
+                docker cp "$extract_dir/$vol_first_entry" "$container_name:/volume/" 2>/dev/null
+            
+            docker stop "$container_name" 2>/dev/null || true
+            docker rm "$container_name" 2>/dev/null || true
+            
+            log "✅ Volume restore completed for $volume_name"
         else
-            local container_name="restore_vol_${volume_name}_$(date +%s)"
-            docker run --rm --name "$container_name" \
+            log "Multiple top-level items found, copying all..."
+            
+            docker run -d --name "$container_name" \
                 -v "$volume_name":/volume \
-                -v "$extract_dir":/restore \
                 "$DOCKER_IMAGE" \
-                sh -c "rm -rf /volume/* && cp -a /restore/. /volume/" || \
-                error_exit "Failed to restore volume $volume_name"
+                sleep infinity 2>/dev/null || \
+                docker run -d --name "$container_name" \
+                    -v "$volume_name":/volume \
+                    alpine sleep infinity 2>/dev/null || {
+                        log "⚠️ Failed to create restore container. Trying with different name..."
+                        container_name="restore_vol_${volume_name}_$(date +%s)_$RANDOM"
+                        docker run -d --name "$container_name" \
+                            -v "$volume_name":/volume \
+                            alpine sleep infinity 2>/dev/null || error_exit "Cannot create restore container"
+                    }
+            
+            sleep 2
+            
+            docker cp "$extract_dir/." "$container_name:/volume/" 2>/dev/null || \
+                docker cp "$extract_dir" "$container_name:/volume/" 2>/dev/null
+            
+            docker stop "$container_name" 2>/dev/null || true
+            docker rm "$container_name" 2>/dev/null || true
+            
+            log "✅ Volume restore completed for $volume_name"
         fi
-        
-        log "✅ Volume restore completed for $volume_name"
         
     else
         error_exit "Unknown backup type: $type"
@@ -683,12 +1223,28 @@ list_backups() {
     echo ""
     echo "📦 Available backups in: $backup_dir"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    find "$backup_dir" -maxdepth 1 -name "*.enc" -type f | sort | while read -r f; do
-        local basename=$(basename "$f")
-        local size=$(human_size $(stat -c%s "$f" 2>/dev/null || echo 0))
-        local date=$(echo "$basename" | grep -o '[0-9]\{8\}_[0-9]\{6\}' | sed 's/_/ /')
-        printf "  %-50s  %-10s  %s\n" "$basename" "$size" "$date"
-    done
+    
+    local found=false
+    while IFS= read -r enc_file; do
+        found=true
+        local basename=$(basename "$enc_file")
+        local size=$(human_size $(stat -c%s "$enc_file" 2>/dev/null || echo 0))
+        local date=$(echo "$basename" | grep -o '[0-9]\{8\}_[0-9]\{6\}' | sed 's/_/ /' | head -1)
+        
+        local checksum_file="${enc_file%.enc}.checksums"
+        local status=""
+        if [[ -f "$checksum_file" ]]; then
+            status="✅"
+        else
+            status="⚠️"
+        fi
+        
+        printf "  %s %-50s  %-10s  %s\n" "$status" "$basename" "$size" "$date"
+    done < <(find "$backup_dir" -name "*.enc" -type f 2>/dev/null | sort)
+    
+    if [[ "$found" == "false" ]]; then
+        echo "  ⚠️  No backups found in: $backup_dir"
+    fi
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
 }
@@ -698,7 +1254,7 @@ do_backup() {
     local start_date=$(date '+%Y-%m-%d %H:%M:%S')
     
     log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    log "🚀 Starting backup"
+    log "🚀 Starting backup (v$VERSION)"
     log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     
     load_config
@@ -720,8 +1276,14 @@ do_backup() {
     log "💾 Target: $BACKUP_BASE_DIR"
     log "💿 Free space: $free_space_human"
     log "🔒 Encryption: AES-256-CBC"
+    log "🔑 PBKDF2 iterations: ${PBKDF2_ITERATIONS:-600000}"
+    if [[ -n "$FIXED_SALT_FILE" ]]; then
+        log "🔗 Deduplication: ENABLED (fixed salt)"
+    else
+        log "🔗 Deduplication: DISABLED (random salt)"
+    fi
     log "🗜️ Compression: gzip level $GZIP_LEVEL"
-    log "📋 Retention: ${RETENTION_DAILY} daily backups"
+    log "📋 Retention: Daily=${RETENTION_DAILY}, Weekly=${RETENTION_WEEKLY}, Monthly=${RETENTION_MONTHLY}"
     
     send_ntfy "🚀 BACKUP STARTED
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -733,8 +1295,10 @@ do_backup() {
 💾 Target: $BACKUP_BASE_DIR
 💿 Free space: $free_space_human
 🔒 Encryption: AES-256-CBC
+🔑 PBKDF2: ${PBKDF2_ITERATIONS:-600000} iterations
+🔗 Deduplication: $([ -n "$FIXED_SALT_FILE" ] && echo "ENABLED" || echo "DISABLED")
 🗜️ Compression: gzip level $GZIP_LEVEL
-📋 Retention: ${RETENTION_DAILY} daily backups" "info"
+📋 Retention: Daily=${RETENTION_DAILY}, Weekly=${RETENTION_WEEKLY}, Monthly=${RETENTION_MONTHLY}" "info"
     
     acquire_lock
     check_docker
@@ -752,8 +1316,9 @@ do_backup() {
     for vol in "${DOCKER_VOLUMES[@]}"; do
         vol_count=$((vol_count + 1))
         log "Processing volume $vol_count of ${#DOCKER_VOLUMES[@]}: $vol"
-        backup_docker_volume "$vol" "$backup_dir"
+        backup_docker_volume "$vol" "$backup_dir" &
     done
+    wait
 
     check_backup_size "$backup_dir"
 
@@ -776,6 +1341,10 @@ do_backup() {
     fi
 
     rotate_backups "$BACKUP_BASE_DIR"
+
+    if [[ -n "$DEDUP_TOOL" ]]; then
+        deduplicate_backups "$BACKUP_BASE_DIR"
+    fi
 
     BACKUP_END_TIME=$(date +%s)
     local duration=$((BACKUP_END_TIME - BACKUP_START_TIME))
@@ -807,7 +1376,8 @@ do_backup() {
 🐳 Volumes: $volume_count volumes
 💿 Free space: $free_space_human → $(human_size $((new_free_space_mb * 1024 * 1024))) (used $space_used_human)
 🔒 Verification: ✅ All checksums verified
-🗑️ Retention: ${RETENTION_DAILY} daily backups kept
+🗑️ Retention: Daily=${RETENTION_DAILY}, Weekly=${RETENTION_WEEKLY}, Monthly=${RETENTION_MONTHLY}
+🔗 Deduplication: $([ -n "$FIXED_SALT_FILE" ] && echo "ENABLED" || echo "DISABLED")
 📍 Location: $backup_dir
 📝 Log: $LOG_FILE" "success"
 
@@ -818,15 +1388,18 @@ do_backup() {
 
 show_help() {
     cat <<EOF
-📦 backup.sh - Enterprise-grade backup script
+📦 backup.sh - Enterprise-grade backup script (v$VERSION)
 
 USAGE:
-    $0 [OPTIONS]
+    $SCRIPT_NAME [OPTIONS]
 
 OPTIONS:
-    --restore <file>   Restore from the specified encrypted backup file
-    --list             List all available backups in the backup directory
-    --help, -h         Show this help message
+    --restore <file>      Restore from the specified encrypted backup file
+    --verify <file>       Verify integrity of a specific backup file
+    --verify-all          Verify all backups in the backup directory
+    --list                List all available backups
+    --dedup               Run deduplication on the backup directory (requires hardlink or jdupes)
+    --help, -h            Show this help message
 
 CONFIGURATION:
     All configuration is stored in backup.conf
@@ -840,6 +1413,16 @@ CONFIGURATION:
         NTFY_TOPIC            - ntfy.sh topic for notifications
         NTFY_TOKEN            - ntfy.sh authentication token
 
+    Optional settings:
+        PBKDF2_ITERATIONS     - PBKDF2 iterations for key derivation (default: 600000)
+                                Higher = more secure but slower. Minimum: 100000
+                                Recommended: 600000+ for 2024 standards
+
+        FIXED_SALT_FILE       - Path to file containing 16 hex chars (8 bytes) for fixed salt
+                                Enables deterministic encryption → identical data yields identical .enc
+                                Allows deduplication via hard links
+        DEDUP_TOOL            - Tool to use for dedup: "hardlink" or "jdupes" (default: hardlink)
+
 EXAMPLES:
     # Perform a full backup
     ./backup.sh
@@ -847,13 +1430,31 @@ EXAMPLES:
     # List available backups
     ./backup.sh --list
 
+    # Verify a specific backup
+    ./backup.sh --verify /path/to/backup.tar.gz.enc
+
+    # Verify all backups
+    ./backup.sh --verify-all
+
     # Restore from a specific backup
-    ./backup.sh --restore /path/to/backup/backup_20250101_120000.tar.gz.enc
+    ./backup.sh --restore /path/to/backup.tar.gz.enc
+
+    # Run deduplication on backup directory (after backup)
+    ./backup.sh --dedup
 
 SECURITY:
     - encryption.key should have permissions 600
     - backup.conf should never be committed to version control
     - All sensitive data is encrypted with AES-256-CBC
+    - PBKDF2 iterations configurable (default: 600000)
+    - Supports both modern (pbkdf2) and legacy encryption methods
+    - Fixed salt reduces randomness but enables deduplication; use only if you trust your environment
+
+NOTES:
+    - Verification uses SHA256 (MD5 removed for security)
+    - Backup rotation now correctly implements daily, weekly, and monthly retention
+    - Notifications sent via ntfy.sh with fallback to custom server
+    - Deduplication reduces storage by hardlinking identical .enc files; requires fixed salt
 
 EOF
 }
@@ -863,18 +1464,36 @@ main() {
         --restore)
             if [[ -z "${2:-}" ]]; then
                 echo "ERROR: Missing backup file for restore."
-                echo "Usage: $0 --restore <backup-file>"
+                echo "Usage: $SCRIPT_NAME --restore <backup-file>"
                 exit 1
             fi
-            # Load config before restore
             load_config
-            init_tmp  # Initialize temp directory
+            init_tmp
             restore_from_backup "$2"
             ;;
+        --verify)
+            if [[ -z "${2:-}" ]]; then
+                echo "ERROR: Missing backup file for verification."
+                echo "Usage: $SCRIPT_NAME --verify <backup-file>"
+                exit 1
+            fi
+            load_config
+            init_tmp
+            verify_backup_integrity "$2"
+            ;;
+        --verify-all)
+            load_config
+            init_tmp
+            verify_all_backups "$BACKUP_BASE_DIR"
+            ;;
         --list)
-            # Load config before listing
             load_config
             list_backups "$BACKUP_BASE_DIR"
+            ;;
+        --dedup)
+            load_config
+            init_tmp
+            deduplicate_backups "$BACKUP_BASE_DIR"
             ;;
         --help|-h)
             show_help
