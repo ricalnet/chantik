@@ -1136,11 +1136,15 @@ backup_docker_volume_incremental() {
         error_exit "Docker volume $volume does not exist"
     fi
 
-    local container_name="chantik_backup_vol_${volume}_$(date +%s)"
+    local container_name="chantik_backup_vol_${volume}_$(date +%s)_$$"
     log_verbose "Creating container: $container_name"
     
     local snapshot_volume="${volume}_snapshot"
-    docker volume create "$snapshot_volume" 2>/dev/null || true
+    
+    docker volume rm "$snapshot_volume" 2>/dev/null || true
+    docker volume create "$snapshot_volume" || error_exit "Failed to create snapshot volume"
+    
+    trap 'docker volume rm "$snapshot_volume" 2>/dev/null || true' EXIT
     
     docker run --rm \
         -v "$volume":/source:ro \
@@ -1232,6 +1236,7 @@ backup_docker_volume_incremental() {
     fi
     
     docker volume rm "$snapshot_volume" 2>/dev/null || true
+    trap - EXIT
 
     if [[ ! -f "${dest_dir}/${volume}.tar" ]]; then
         error_exit "Tar file not created for volume $volume"
@@ -1831,7 +1836,8 @@ restore_from_backup() {
         fi
 
         local container_name="chantik_restore_vol_${volume_name}_$(date +%s)_$$"
-        docker run -d --name "$container_name" -v "$volume_name":/volume alpine sleep infinity 2>/dev/null || \
+        docker run -d --name "$container_name" -v "$volume_name":/volume "$DOCKER_IMAGE" sleep infinity 2>/dev/null || \
+            docker run -d --name "$container_name" -v "$volume_name":/volume alpine sleep infinity 2>/dev/null || \
             error_exit "Cannot create restore container"
 
         docker cp "$staging_dir/." "$container_name:/volume/" 2>/dev/null || \
