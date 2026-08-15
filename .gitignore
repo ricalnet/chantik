@@ -8,3 +8,4 @@ backup/
 *.test
 .test/
 fixed_salt.txt
+test_backup_restore.sh

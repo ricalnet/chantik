@@ -925,12 +925,12 @@ backup_directory_incremental() {
     if [[ "$do_full" == "true" ]]; then
         log "Creating FULL backup archive..."
         
-        tar -cf "$tar_file" -C "$(dirname "$src")" "${exclude_opts[@]}" \
+        tar -cf "$tar_file" -C "$src" "${exclude_opts[@]}" \
             --preserve-permissions --same-owner --xattrs \
-            "$(basename "$src")" 2>/dev/null || \
-            tar -cf "$tar_file" -C "$(dirname "$src")" "${exclude_opts[@]}" \
+            . 2>/dev/null || \
+        tar -cf "$tar_file" -C "$src" "${exclude_opts[@]}" \
             --preserve-permissions --same-owner \
-            "$(basename "$src")" 2>/dev/null || {
+            . 2>/dev/null || {
                 error_exit "Failed to create full tar archive"
             }
         
@@ -956,17 +956,17 @@ backup_directory_incremental() {
         local file_count=0
         
         if command -v find &>/dev/null; then
-            if find "$src" -type f -newermt "@$last_backup_time" > "$changed_files" 2>/dev/null; then
-                file_count=$(wc -l < "$changed_files" 2>/dev/null || echo 0)
-            elif [[ -f "$snapshot_file" ]] && find "$src" -type f -newer "$snapshot_file" > "$changed_files" 2>/dev/null; then
-                file_count=$(wc -l < "$changed_files" 2>/dev/null || echo 0)
-            else
-                find "$src" -type f -mtime -1 > "$changed_files" 2>/dev/null
-                file_count=$(wc -l < "$changed_files" 2>/dev/null || echo 0)
+            (cd "$src" && find . -type f -newermt "@$last_backup_time" 2>/dev/null | sed 's|^\./||') > "$changed_files"
+            if [[ ! -s "$changed_files" ]] && [[ -f "$snapshot_file" ]]; then
+                (cd "$src" && find . -type f -newer "$snapshot_file" 2>/dev/null | sed 's|^\./||') > "$changed_files"
             fi
+            if [[ ! -s "$changed_files" ]]; then
+                (cd "$src" && find . -type f -mtime -1 2>/dev/null | sed 's|^\./||') > "$changed_files"
+            fi
+            file_count=$(wc -l < "$changed_files" 2>/dev/null || echo 0)
         else
             if command -v rsync &>/dev/null; then
-                rsync -avn --delete "$src/" /dev/null 2>/dev/null | grep -v "^sending" | grep -v "^$" > "$changed_files" 2>/dev/null
+                (cd "$src" && rsync -avn --delete ./ /dev/null 2>/dev/null | grep -v "^sending" | grep -v "^$" | sed 's|^\./||') > "$changed_files"
                 file_count=$(wc -l < "$changed_files" 2>/dev/null || echo 0)
             else
                 log "⚠️ Cannot detect changes. Forcing FULL backup."
@@ -982,21 +982,13 @@ backup_directory_incremental() {
         if [[ -s "$changed_files" ]]; then
             log "📊 Found $file_count changed files"
             
-            tar -cf "$tar_file" -C "$(dirname "$src")" \
+            tar -cf "$tar_file" -C "$src" \
                 --preserve-permissions --same-owner --xattrs \
                 --files-from="$changed_files" 2>/dev/null || \
-                tar -cf "$tar_file" -C "$(dirname "$src")" \
+            tar -cf "$tar_file" -C "$src" \
                 --preserve-permissions --same-owner \
                 --files-from="$changed_files" 2>/dev/null || {
-                    log_verbose "Tar with --files-from failed, trying alternative method..."
-                    sed "s|^$(dirname "$src")/||" "$changed_files" > "${changed_files}.rel" 2>/dev/null
-                    tar -cf "$tar_file" -C "$(dirname "$src")" \
-                        --preserve-permissions --same-owner \
-                        -T "${changed_files}.rel" 2>/dev/null || {
-                        rm -f "$changed_files" "${changed_files}.rel" 2>/dev/null
-                        error_exit "Failed to create incremental tar archive"
-                    }
-                    rm -f "${changed_files}.rel" 2>/dev/null
+                    error_exit "Failed to create incremental tar archive"
                 }
             
             if [[ -f "$snapshot_file" ]]; then
@@ -1720,13 +1712,22 @@ restore_from_backup() {
     local base="$BASE"
 
     local restore_type=""
+    local dest_dir=""
+    local volume_name=""
     if [[ "$base" == "digital-independence" ]] || [[ "$base" == "$(basename "$SOURCE_DIR")" ]]; then
         restore_type="dir"
+        dest_dir="${SOURCE_DIR%/}"
     elif [[ "$base" =~ ^volume_ ]]; then
         restore_type="volume"
-        local volume_name="${base#volume_}"
+        volume_name="${base#volume_}"
     else
         restore_type="dir"
+        dest_dir="${SOURCE_DIR%/}"
+    fi
+
+    local old_stats=""
+    if [[ -n "$dest_dir" ]] && [[ -d "$dest_dir" ]]; then
+        old_stats="$(get_restore_stats "$dest_dir")"
     fi
 
     local checksum_ok=true
@@ -1776,38 +1777,14 @@ restore_from_backup() {
     IFS='|' read -r staging_files staging_dirs staging_size <<< "$(get_restore_stats "$staging_dir")"
 
     if [[ "$restore_type" == "dir" ]]; then
-        local dest_dir="$SOURCE_DIR"
-        dest_dir="${dest_dir%/}"
-        
-        local top_level_items=($(ls -A "$staging_dir" 2>/dev/null))
-        local use_subdir=false
-        
-        local old_stats=""
-        if [[ -d "$dest_dir" ]]; then
-            old_stats="$(get_restore_stats "$dest_dir")"
-        fi
+        mkdir -p "$dest_dir" 2>/dev/null || sudo mkdir -p "$dest_dir" 2>/dev/null
         
         log "📁 Restoring directory to $dest_dir"
-
-        if [[ ! -d "$dest_dir" ]]; then
-            mkdir -p "$dest_dir" 2>/dev/null || sudo mkdir -p "$dest_dir" 2>/dev/null
-            log "📁 Created destination directory: $dest_dir"
-        fi
-
-        if [[ ${#top_level_items[@]} -eq 1 ]] && [[ -d "$staging_dir/${top_level_items[0]}" ]]; then
-            local src_content="$staging_dir/${top_level_items[0]}"
-            log "📋 Moving contents from $src_content to $dest_dir"
-            if command -v rsync &>/dev/null; then
-                rsync -a --no-owner --no-group "$src_content/" "$dest_dir/" 2>/dev/null
-            else
-                cp -a "$src_content/." "$dest_dir/" 2>/dev/null
-            fi
+        
+        if command -v rsync &>/dev/null; then
+            rsync -a --no-owner --no-group "$staging_dir/" "$dest_dir/" 2>/dev/null
         else
-            if command -v rsync &>/dev/null; then
-                rsync -a --no-owner --no-group "$staging_dir/" "$dest_dir/" 2>/dev/null
-            else
-                cp -a "$staging_dir/." "$dest_dir/" 2>/dev/null
-            fi
+            cp -a "$staging_dir/." "$dest_dir/" 2>/dev/null
         fi
         
         local new_stats
@@ -1827,10 +1804,12 @@ restore_from_backup() {
             IFS='|' read -r old_files old_dirs old_size <<< "$old_stats"
             local changed_files=$((new_files - old_files))
             local changed_dirs=$((new_dirs - old_dirs))
-            if [[ $changed_files -gt 0 ]] || [[ $changed_dirs -gt 0 ]]; then
+            if [[ $changed_files -ne 0 ]] || [[ $changed_dirs -ne 0 ]]; then
                 log "🔄 Changes applied:"
                 [[ $changed_files -ne 0 ]] && log "   Files:     $([ $changed_files -gt 0 ] && echo "+$changed_files" || echo "$changed_files")"
                 [[ $changed_dirs -ne 0 ]] && log "   Directories: $([ $changed_dirs -gt 0 ] && echo "+$changed_dirs" || echo "$changed_dirs")"
+            else
+                log "ℹ️  No changes detected (already up-to-date)"
             fi
         fi
         
