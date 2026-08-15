@@ -1,6 +1,10 @@
-*.test
-*.tmp
-*.txt
-*.key
-*.log
 chantik.conf
+encryption.key
+*.key
+*.enc
+backup/
+.tmp/
+*.log
+*.test
+.test/
+fixed_salt.txt

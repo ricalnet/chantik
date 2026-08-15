@@ -50,7 +50,7 @@ NTFY_CUSTOM_SERVER=""
 FIXED_SALT_FILE=""
 DEDUP_TOOL="hardlink"
 PBKDF2_ITERATIONS=600000
-INCREMENTAL_ENABLED=false
+INCREMENTAL_ENABLED="true"
 INCREMENTAL_BASE_DIR="${BACKUP_BASE_DIR}/.incremental"
 SNAPSHOT_FILE=""
 FULL_BACKUP_INTERVAL=7
@@ -637,6 +637,113 @@ fix_encrypted_filename() {
     else
         echo "$file"
     fi
+}
+
+parse_backup_filename() {
+    local filename=$(basename "$1")
+    if [[ "$filename" =~ ^(.*)_([0-9]{8}_[0-9]{6})_(full|inc)\.tar\.gz\.enc$ ]]; then
+        BASE="${BASH_REMATCH[1]}"
+        TIMESTAMP="${BASH_REMATCH[2]}"
+        TYPE="${BASH_REMATCH[3]}"
+        return 0
+    elif [[ "$filename" =~ ^(.*)_(full|inc)\.tar\.gz\.enc$ ]]; then
+        BASE="${BASH_REMATCH[1]}"
+        TIMESTAMP=$(stat -c %Y "$1" 2>/dev/null || date +%s)
+        TYPE="${BASH_REMATCH[2]}"
+        return 0
+    else
+        BASE="${filename%%.tar.gz.enc}"
+        TIMESTAMP=$(stat -c %Y "$1" 2>/dev/null || date +%s)
+        TYPE="full"
+        return 1
+    fi
+}
+
+get_restore_file_list() {
+    local selected_file="$1"
+    local base timestamp type
+    parse_backup_filename "$selected_file" || return 1
+    local base_name="$BASE"
+
+    local all_files=()
+    while IFS= read -r f; do
+        all_files+=("$f")
+    done < <(find "$BACKUP_BASE_DIR" -type f -name "*.enc" 2>/dev/null | sort)
+
+    if [[ ${#all_files[@]} -eq 0 ]]; then
+        echo "ERROR: No .enc files found in $BACKUP_BASE_DIR" >&2
+        return 1
+    fi
+
+    local -a matched=()
+    for f in "${all_files[@]}"; do
+        local b ts typ
+        parse_backup_filename "$f"
+        if [[ "$BASE" == "$base_name" ]]; then
+            matched+=("$f|$TIMESTAMP|$TYPE")
+        fi
+    done
+
+    if [[ ${#matched[@]} -eq 0 ]]; then
+        echo "ERROR: No backup files found for base '$base_name' in $BACKUP_BASE_DIR" >&2
+        return 1
+    fi
+
+    local -a sorted=()
+    for entry in "${matched[@]}"; do
+        IFS='|' read -r path ts typ <<< "$entry"
+        local epoch="$ts"
+        if [[ "$ts" =~ ^[0-9]{8}_[0-9]{6}$ ]]; then
+            epoch=$(date -d "${ts:0:8} ${ts:9:2}:${ts:11:2}:${ts:13:2}" +%s 2>/dev/null || echo 0)
+        fi
+        sorted+=("$epoch|$typ|$path")
+    done
+
+    IFS=$'\n' sorted=($(sort -t'|' -k1 -n <<<"${sorted[*]}"))
+    unset IFS
+
+    local selected_idx=-1
+    for i in "${!sorted[@]}"; do
+        local f="${sorted[$i]##*|}"
+        if [[ "$f" == "$selected_file" ]]; then
+            selected_idx=$i
+            break
+        fi
+    done
+
+    if [[ $selected_idx -eq -1 ]]; then
+        echo "ERROR: Selected file not found after sorting" >&2
+        return 1
+    fi
+
+    local sel_typ="${sorted[$selected_idx]#*|}"
+    sel_typ="${sel_typ%%|*}"
+
+    local start_idx=$selected_idx
+    if [[ "$sel_typ" == "inc" ]]; then
+        local found_full=-1
+        for ((i=selected_idx-1; i>=0; i--)); do
+            local typ="${sorted[$i]#*|}"
+            typ="${typ%%|*}"
+            if [[ "$typ" == "full" ]]; then
+                found_full=$i
+                break
+            fi
+        done
+        if [[ $found_full -eq -1 ]]; then
+            echo "ERROR: No full backup found before incremental file" >&2
+            return 1
+        fi
+        start_idx=$found_full
+    fi
+
+    local -a restore_files=()
+    for ((i=start_idx; i<=selected_idx; i++)); do
+        local f="${sorted[$i]##*|}"
+        restore_files+=("$f")
+    done
+
+    printf '%s\n' "${restore_files[@]}"
 }
 
 get_snapshot_file() {
@@ -1576,239 +1683,123 @@ restore_from_backup() {
 
     init_tmp
 
-    local file_basename
-    file_basename=$(basename "$enc_file")
-    
-    local type
-    if echo "$file_basename" | grep -qE '_[0-9]{8}_[0-9]{6}\.tar\.gz\.enc$'; then
-        type=$(echo "$file_basename" | sed -E 's/_[0-9]{8}_[0-9]{6}\.tar\.gz\.enc$//')
+    local restore_files
+    mapfile -t restore_files < <(get_restore_file_list "$enc_file") || error_exit "Failed to determine restore files"
+
+    if [[ ${#restore_files[@]} -eq 0 ]]; then
+        error_exit "No files to restore"
+    fi
+
+    log "🔄 Restoring from ${#restore_files[@]} backup(s):"
+    for f in "${restore_files[@]}"; do
+        log "   - $(basename "$f")"
+    done
+
+    local staging_dir
+    staging_dir=$(mktemp -d -p "$TMP_DIR" restore_staging_XXXXXX)
+    trap 'rm -rf "$staging_dir" 2>/dev/null; cleanup_temp; exit' INT TERM EXIT
+
+    local first_file="${restore_files[0]}"
+    local base_name timestamp type
+    parse_backup_filename "$first_file"
+    local base="$BASE"
+
+    local restore_type=""
+    if [[ "$base" == "digital-independence" ]] || [[ "$base" == "$(basename "$SOURCE_DIR")" ]]; then
+        restore_type="dir"
+    elif [[ "$base" =~ ^volume_ ]]; then
+        restore_type="volume"
+        local volume_name="${base#volume_}"
     else
-        type=$(echo "$file_basename" | sed -E 's/\.tar\.gz\.enc$//')
-    fi
-    
-    type=$(echo "$type" | sed -E 's/_(full|inc)$//')
-    
-    log "🔄 Restoring type: $type"
-
-    local tmp_dir
-    tmp_dir=$(mktemp -d -p "$TMP_DIR" restore_XXXXXX)
-    
-    trap 'rm -rf "$tmp_dir" 2>/dev/null || true; cleanup_temp; exit' INT TERM EXIT
-    
-    local decrypted_file="${tmp_dir}/$(basename "${enc_file%.enc}")"
-    log "🔐 Decrypting $(basename "$enc_file") with ChaCha20..."
-    decrypt_file "$enc_file" "$decrypted_file"
-
-    if [[ ! -f "$decrypted_file" ]]; then
-        error_exit "Decryption failed or output missing"
+        restore_type="dir"
     fi
 
-    local checksum_file="${enc_file%.enc}.checksums"
-    if [[ -f "$checksum_file" ]]; then
-        log "🔍 Verifying checksum..."
-        local sha_original
-        sha_original=$(grep '^SHA256:' "$checksum_file" | awk '{print $2}')
-        local sha_current
-        sha_current=$(sha256sum "$decrypted_file" | awk '{print $1}')
-        if [[ "$sha_original" != "$sha_current" ]]; then
-            error_exit "SHA256 checksum mismatch! Restore aborted."
-        else
-            log "✅ Checksum verification passed."
+    for enc in "${restore_files[@]}"; do
+        log "📦 Processing: $(basename "$enc")"
+        local decrypted_gz="${staging_dir}/$(basename "${enc%.enc}")"
+        log "🔐 Decrypting..."
+        decrypt_file "$enc" "$decrypted_gz" || error_exit "Decryption failed for $enc"
+
+        local checksum_file="${enc%.enc}.checksums"
+        if [[ -f "$checksum_file" ]]; then
+            local stored_sha=$(grep '^SHA256:' "$checksum_file" | awk '{print $2}')
+            local current_sha=$(sha256sum "$decrypted_gz" | awk '{print $1}')
+            if [[ "$stored_sha" != "$current_sha" ]]; then
+                error_exit "Checksum mismatch for $enc"
+            fi
+            log "✅ Checksum verified"
         fi
-    else
-        log "⚠️ WARNING: No checksum file found; skipping verification."
-    fi
 
-    log "📦 Decompressing $(basename "$decrypted_file")..."
-    gzip -d "$decrypted_file" 2>/dev/null || error_exit "Gunzip failed"
-    local tar_file="${decrypted_file%.gz}"
-    if [[ ! -f "$tar_file" ]]; then
-        error_exit "Decompression failed: $(basename "$tar_file") not found"
-    fi
+        log "🗜️ Decompressing..."
+        gunzip -f "$decrypted_gz" || error_exit "Gunzip failed"
+        local tar_file="${decrypted_gz%.gz}"
+        if [[ ! -f "$tar_file" ]]; then
+            error_exit "Tar file not found after decompression"
+        fi
 
-    if [[ "$type" == "$(basename "$SOURCE_DIR")" ]] || [[ "$type" == "chantik-directory" ]] || [[ "$type" == "digital-independence" ]]; then
+        log "📂 Extracting to staging..."
+        tar -xf "$tar_file" -C "$staging_dir" --overwrite --preserve-permissions 2>/dev/null || \
+            tar -xf "$tar_file" -C "$staging_dir" --overwrite 2>/dev/null || \
+            error_exit "Failed to extract tar"
+
+        rm -f "$tar_file" "$decrypted_gz" 2>/dev/null
+    done
+
+    log "✅ All backups extracted to staging: $staging_dir"
+
+    if [[ "$restore_type" == "dir" ]]; then
         local dest_dir="$SOURCE_DIR"
         dest_dir="${dest_dir%/}"
-        
-        log "📁 Restoring directory backup to $dest_dir"
-        
-        local use_sudo=false
-        if [[ ! -w "$(dirname "$dest_dir")" ]] || [[ ! -w "$dest_dir" && -d "$dest_dir" ]]; then
-            log "⚠️ Destination requires sudo privileges"
-            use_sudo=true
-        fi
-        
-        if [[ "$use_sudo" == "true" ]]; then
-            sudo mkdir -p "$(dirname "$dest_dir")"
-            sudo mkdir -p "$dest_dir"
-        else
-            mkdir -p "$(dirname "$dest_dir")"
-            mkdir -p "$dest_dir"
-        fi
-        
-        local first_entry=$(tar -tf "$tar_file" 2>/dev/null | head -1)
-        
-        if [[ -z "$first_entry" ]]; then
-            error_exit "Tar file appears to be empty or corrupted"
-        fi
-        
-        log_verbose "First entry in tar: $first_entry"
-        
-        local top_dir=$(echo "$first_entry" | cut -d'/' -f1)
-        
-        local all_under_top=true
-        local other_files=$(tar -tf "$tar_file" 2>/dev/null | grep -v "^$top_dir/" | grep -v "^$top_dir$" | head -1)
-        if [[ -n "$other_files" ]]; then
-            all_under_top=false
-        fi
-        
-        if [[ "$all_under_top" == "true" ]] && [[ -n "$top_dir" ]]; then
-            log "📋 Tar contains all files under top-level directory: $top_dir"
-            
-            local extract_dir="${tmp_dir}/extract"
-            mkdir -p "$extract_dir"
-            tar -xf "$tar_file" -C "$extract_dir" --preserve-permissions --same-owner
-            
-            if [[ -d "$extract_dir/$top_dir" ]]; then
-                log "📋 Moving contents from $top_dir to $dest_dir"
-                
-                if [[ "$use_sudo" == "true" ]]; then
-                    if command -v rsync &> /dev/null; then
-                        sudo rsync -a --no-owner --no-group "$extract_dir/$top_dir/" "$dest_dir/"
-                    else
-                        sudo cp -a "$extract_dir/$top_dir/." "$dest_dir/"
-                    fi
-                else
-                    if command -v rsync &> /dev/null; then
-                        rsync -a --no-owner --no-group "$extract_dir/$top_dir/" "$dest_dir/"
-                    else
-                        cp -a "$extract_dir/$top_dir/." "$dest_dir/"
-                    fi
-                fi
-                
-                log "✅ Successfully restored all files to $dest_dir"
-                
-                if [[ "$use_sudo" == "true" ]]; then
-                    local current_user="${SUDO_USER:-$(whoami)}"
-                    sudo chown -R "$current_user":"$current_user" "$dest_dir" 2>/dev/null || true
-                fi
-                
-                rm -rf "$extract_dir"
+        log "📁 Restoring directory to $dest_dir"
+
+        local top_level_items=($(ls -A "$staging_dir"))
+        if [[ ${#top_level_items[@]} -eq 1 ]] && [[ -d "$staging_dir/${top_level_items[0]}" ]]; then
+            local src_content="$staging_dir/${top_level_items[0]}"
+            log "📋 Moving contents from $src_content to $dest_dir"
+            if command -v rsync &>/dev/null; then
+                rsync -a --no-owner --no-group "$src_content/" "$dest_dir/"
             else
-                log "📋 Fallback: Extracting directly to $dest_dir"
-                if [[ "$use_sudo" == "true" ]]; then
-                    sudo tar -xf "$tar_file" -C "$dest_dir" --preserve-permissions --same-owner
-                else
-                    tar -xf "$tar_file" -C "$dest_dir" --preserve-permissions --same-owner
-                fi
-                log "✅ Directory restore completed to $dest_dir"
+                cp -a "$src_content/." "$dest_dir/"
             fi
         else
-            log "📋 Tar contains multiple top-level items or flat structure"
-            
-            if [[ "$use_sudo" == "true" ]]; then
-                sudo tar -xf "$tar_file" -C "$dest_dir" --preserve-permissions --same-owner
+            if command -v rsync &>/dev/null; then
+                rsync -a --no-owner --no-group "$staging_dir/" "$dest_dir/"
             else
-                tar -xf "$tar_file" -C "$dest_dir" --preserve-permissions --same-owner
+                cp -a "$staging_dir/." "$dest_dir/"
             fi
-            log "✅ Directory restore completed to $dest_dir"
         fi
-        
-        if [[ -d "$dest_dir" ]] && [[ -n "$(ls -A "$dest_dir" 2>/dev/null)" ]]; then
-            log "✅ Restore verified: $dest_dir contains files"
-            local restored_count=$(find "$dest_dir" -type f 2>/dev/null | wc -l)
-            log "📊 Restored $restored_count files"
-        else
-            log "⚠️ Warning: $dest_dir appears to be empty after restore"
-        fi
-        
-    elif [[ "$type" =~ ^volume_ ]] || [[ "$type" =~ ^volume_.*_(full|inc)$ ]]; then
-        local volume_name=$(echo "$type" | sed -E 's/^volume_//' | sed -E 's/_(full|inc)$//')
+        log "✅ Directory restore completed to $dest_dir"
+
+    elif [[ "$restore_type" == "volume" ]]; then
         log "📦 Restoring Docker volume: $volume_name"
-        
         if ! docker volume inspect "$volume_name" &>/dev/null; then
-            log "📂 Volume $volume_name does not exist; creating it."
             docker volume create "$volume_name" || error_exit "Failed to create volume $volume_name"
         fi
-        
-        local extract_dir="${tmp_dir}/extract_vol"
-        mkdir -p "$extract_dir"
-        
-        tar -xf "$tar_file" -C "$extract_dir" --no-same-owner --no-same-permissions 2>/dev/null || \
-            tar -xf "$tar_file" -C "$extract_dir" --no-same-owner
-        
-        local vol_first_entry=$(ls -A "$extract_dir" 2>/dev/null | head -1)
-        
+
         local container_name="chantik_restore_vol_${volume_name}_$(date +%s)_$$"
-        
-        if [[ -d "$extract_dir/$vol_first_entry" ]] && [[ $(ls -A "$extract_dir" 2>/dev/null | wc -l) -eq 1 ]]; then
-            log "📋 Volume data is under single directory: $vol_first_entry"
-            
-            docker run -d --name "$container_name" \
-                -v "$volume_name":/volume \
-                "$DOCKER_IMAGE" \
-                timeout 30 sleep infinity 2>/dev/null || \
-                docker run -d --name "$container_name" \
-                    -v "$volume_name":/volume \
-                    alpine sleep infinity 2>/dev/null || {
-                        log "⚠️ Failed to create restore container. Trying with different name..."
-                        container_name="chantik_restore_vol_${volume_name}_$(date +%s)_$RANDOM"
-                        docker run -d --name "$container_name" \
-                            -v "$volume_name":/volume \
-                            alpine sleep infinity 2>/dev/null || error_exit "Cannot create restore container"
-                    }
-            
-            sleep 2
-            
-            docker cp "$extract_dir/$vol_first_entry/." "$container_name:/volume/" 2>/dev/null || \
-                docker cp "$extract_dir/$vol_first_entry" "$container_name:/volume/" 2>/dev/null
-            
-            docker stop "$container_name" 2>/dev/null || true
-            docker rm "$container_name" 2>/dev/null || true
-            
-            log "✅ Volume restore completed for $volume_name"
-        else
-            log "📋 Multiple top-level items found, copying all..."
-            
-            docker run -d --name "$container_name" \
-                -v "$volume_name":/volume \
-                "$DOCKER_IMAGE" \
-                sleep infinity 2>/dev/null || \
-                docker run -d --name "$container_name" \
-                    -v "$volume_name":/volume \
-                    alpine sleep infinity 2>/dev/null || {
-                        log "⚠️ Failed to create restore container. Trying with different name..."
-                        container_name="chantik_restore_vol_${volume_name}_$(date +%s)_$RANDOM"
-                        docker run -d --name "$container_name" \
-                            -v "$volume_name":/volume \
-                            alpine sleep infinity 2>/dev/null || error_exit "Cannot create restore container"
-                    }
-            
-            sleep 2
-            
-            docker cp "$extract_dir/." "$container_name:/volume/" 2>/dev/null || \
-                docker cp "$extract_dir" "$container_name:/volume/" 2>/dev/null
-            
-            docker stop "$container_name" 2>/dev/null || true
-            docker rm "$container_name" 2>/dev/null || true
-            
-            log "✅ Volume restore completed for $volume_name"
-        fi
-        
+        docker run -d --name "$container_name" -v "$volume_name":/volume alpine sleep infinity 2>/dev/null || \
+            error_exit "Cannot create restore container"
+
+        docker cp "$staging_dir/." "$container_name:/volume/" 2>/dev/null || \
+            docker cp "$staging_dir" "$container_name:/volume/" 2>/dev/null || \
+            error_exit "Failed to copy data to volume"
+
+        docker stop "$container_name" >/dev/null 2>&1
+        docker rm "$container_name" >/dev/null 2>&1
+        log "✅ Volume restore completed for $volume_name"
     else
-        error_exit "Unknown backup type: $type"
+        error_exit "Unknown restore type"
     fi
 
-    rm -rf "$tmp_dir" 2>/dev/null || true
+    rm -rf "$staging_dir" 2>/dev/null
     trap - INT TERM EXIT
-    
-    local restore_msg="📁 File: $(basename "$enc_file")\n"
-    restore_msg+="📂 Type: $type\n"
+
+    local restore_msg="📁 Restored from ${#restore_files[@]} backup(s)\n"
+    restore_msg+="📂 Type: $restore_type\n"
     restore_msg+="⏱️ Time: $(date '+%Y-%m-%d %H:%M:%S')\n"
     restore_msg+="✅ Status: Restore completed successfully"
-    
     send_ntfy "$restore_msg" "restore"
-    
+
     log "✅ Restore completed successfully."
 }
 
