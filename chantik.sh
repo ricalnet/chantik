@@ -380,6 +380,21 @@ get_file_count() {
     find "$1" -type f 2>/dev/null | wc -l || echo 0
 }
 
+get_restore_stats() {
+    local dir="$1"
+    local file_count=0
+    local dir_count=0
+    local total_size=0
+    
+    if [[ -d "$dir" ]]; then
+        file_count=$(find "$dir" -type f 2>/dev/null | wc -l)
+        dir_count=$(find "$dir" -type d 2>/dev/null | wc -l)
+        total_size=$(du -sb "$dir" 2>/dev/null | awk '{print $1}')
+    fi
+    
+    echo "$file_count|$dir_count|$total_size"
+}
+
 check_disk_space() {
     local target_dir="$1"
     local required_mb="$2"
@@ -1714,6 +1729,9 @@ restore_from_backup() {
         restore_type="dir"
     fi
 
+    local checksum_ok=true
+    local checksum_failed=0
+
     for enc in "${restore_files[@]}"; do
         log "📦 Processing: $(basename "$enc")"
         local decrypted_gz="${staging_dir}/$(basename "${enc%.enc}")"
@@ -1725,9 +1743,16 @@ restore_from_backup() {
             local stored_sha=$(grep '^SHA256:' "$checksum_file" | awk '{print $2}')
             local current_sha=$(sha256sum "$decrypted_gz" | awk '{print $1}')
             if [[ "$stored_sha" != "$current_sha" ]]; then
-                error_exit "Checksum mismatch for $enc"
+                log "❌ Checksum MISMATCH for $(basename "$enc")"
+                log "   Stored:  $stored_sha"
+                log "   Current: $current_sha"
+                checksum_ok=false
+                checksum_failed=$((checksum_failed + 1))
+            else
+                log "✅ Checksum verified: $(basename "$enc")"
             fi
-            log "✅ Checksum verified"
+        else
+            log "⚠️ No checksum file found for $(basename "$enc")"
         fi
 
         log "🗜️ Decompressing..."
@@ -1747,33 +1772,83 @@ restore_from_backup() {
 
     log "✅ All backups extracted to staging: $staging_dir"
 
+    local staging_stats
+    IFS='|' read -r staging_files staging_dirs staging_size <<< "$(get_restore_stats "$staging_dir")"
+
     if [[ "$restore_type" == "dir" ]]; then
         local dest_dir="$SOURCE_DIR"
         dest_dir="${dest_dir%/}"
+        
+        local top_level_items=($(ls -A "$staging_dir" 2>/dev/null))
+        local use_subdir=false
+        
+        local old_stats=""
+        if [[ -d "$dest_dir" ]]; then
+            old_stats="$(get_restore_stats "$dest_dir")"
+        fi
+        
         log "📁 Restoring directory to $dest_dir"
 
-        local top_level_items=($(ls -A "$staging_dir"))
+        if [[ ! -d "$dest_dir" ]]; then
+            mkdir -p "$dest_dir" 2>/dev/null || sudo mkdir -p "$dest_dir" 2>/dev/null
+            log "📁 Created destination directory: $dest_dir"
+        fi
+
         if [[ ${#top_level_items[@]} -eq 1 ]] && [[ -d "$staging_dir/${top_level_items[0]}" ]]; then
             local src_content="$staging_dir/${top_level_items[0]}"
             log "📋 Moving contents from $src_content to $dest_dir"
             if command -v rsync &>/dev/null; then
-                rsync -a --no-owner --no-group "$src_content/" "$dest_dir/"
+                rsync -a --no-owner --no-group "$src_content/" "$dest_dir/" 2>/dev/null
             else
-                cp -a "$src_content/." "$dest_dir/"
+                cp -a "$src_content/." "$dest_dir/" 2>/dev/null
             fi
         else
             if command -v rsync &>/dev/null; then
-                rsync -a --no-owner --no-group "$staging_dir/" "$dest_dir/"
+                rsync -a --no-owner --no-group "$staging_dir/" "$dest_dir/" 2>/dev/null
             else
-                cp -a "$staging_dir/." "$dest_dir/"
+                cp -a "$staging_dir/." "$dest_dir/" 2>/dev/null
             fi
         fi
+        
+        local new_stats
+        IFS='|' read -r new_files new_dirs new_size <<< "$(get_restore_stats "$dest_dir")"
+        
+        log ""
+        log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        log "📊 RESTORE SUMMARY"
+        log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        log "📂 Destination: $dest_dir"
+        log "📁 Directories: $new_dirs"
+        log "📄 Files:       $new_files"
+        log "💾 Total size:  $(human_size $new_size)"
+        log ""
+        
+        if [[ -n "$old_stats" ]]; then
+            IFS='|' read -r old_files old_dirs old_size <<< "$old_stats"
+            local changed_files=$((new_files - old_files))
+            local changed_dirs=$((new_dirs - old_dirs))
+            if [[ $changed_files -gt 0 ]] || [[ $changed_dirs -gt 0 ]]; then
+                log "🔄 Changes applied:"
+                [[ $changed_files -ne 0 ]] && log "   Files:     $([ $changed_files -gt 0 ] && echo "+$changed_files" || echo "$changed_files")"
+                [[ $changed_dirs -ne 0 ]] && log "   Directories: $([ $changed_dirs -gt 0 ] && echo "+$changed_dirs" || echo "$changed_dirs")"
+            fi
+        fi
+        
+        log ""
+        if [[ "$checksum_ok" == "true" ]]; then
+            log "🔐 Checksum: ✅ ALL VERIFIED (${#restore_files[@]} files)"
+        else
+            log "🔐 Checksum: ⚠️ $checksum_failed of ${#restore_files[@]} failed verification!"
+        fi
+        
+        log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         log "✅ Directory restore completed to $dest_dir"
 
     elif [[ "$restore_type" == "volume" ]]; then
         log "📦 Restoring Docker volume: $volume_name"
         if ! docker volume inspect "$volume_name" &>/dev/null; then
             docker volume create "$volume_name" || error_exit "Failed to create volume $volume_name"
+            log "📦 Created volume: $volume_name"
         fi
 
         local container_name="chantik_restore_vol_${volume_name}_$(date +%s)_$$"
@@ -1786,6 +1861,22 @@ restore_from_backup() {
 
         docker stop "$container_name" >/dev/null 2>&1
         docker rm "$container_name" >/dev/null 2>&1
+        
+        log ""
+        log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        log "📊 RESTORE SUMMARY"
+        log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        log "🐳 Volume: $volume_name"
+        log "📁 Directories: $staging_dirs"
+        log "📄 Files:       $staging_files"
+        log "💾 Total size:  $(human_size $staging_size)"
+        log ""
+        if [[ "$checksum_ok" == "true" ]]; then
+            log "🔐 Checksum: ✅ ALL VERIFIED (${#restore_files[@]} files)"
+        else
+            log "🔐 Checksum: ⚠️ $checksum_failed of ${#restore_files[@]} failed verification!"
+        fi
+        log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         log "✅ Volume restore completed for $volume_name"
     else
         error_exit "Unknown restore type"
@@ -1796,6 +1887,10 @@ restore_from_backup() {
 
     local restore_msg="📁 Restored from ${#restore_files[@]} backup(s)\n"
     restore_msg+="📂 Type: $restore_type\n"
+    restore_msg+="📄 Files: $staging_files\n"
+    restore_msg+="📁 Directories: $staging_dirs\n"
+    restore_msg+="💾 Size: $(human_size $staging_size)\n"
+    restore_msg+="🔐 Checksum: $([ "$checksum_ok" == "true" ] && echo "✅ ALL VERIFIED" || echo "⚠️ $checksum_failed FAILED")\n"
     restore_msg+="⏱️ Time: $(date '+%Y-%m-%d %H:%M:%S')\n"
     restore_msg+="✅ Status: Restore completed successfully"
     send_ntfy "$restore_msg" "restore"
@@ -1865,13 +1960,14 @@ do_backup() {
     local source_size=$(get_dir_size "$SOURCE_DIR")
     local source_size_human=$(human_size "$source_size")
     local source_files=$(get_file_count "$SOURCE_DIR")
+    local source_dirs=$(find "$SOURCE_DIR" -type d 2>/dev/null | wc -l)
     local volume_count=${#DOCKER_VOLUMES[@]}
     local free_space_mb
     free_space_mb=$(df -m "$BACKUP_BASE_DIR" | awk 'NR==2 {print $4}')
     local free_space_human=$(human_size $((free_space_mb * 1024 * 1024)))
     
     log "📁 Source: $SOURCE_DIR"
-    log "📊 Size: $source_size_human ($source_files files)"
+    log "📊 Size: $source_size_human ($source_files files, $source_dirs directories)"
     log "🐳 Volumes: $volume_count volumes"
     log "💾 Target: $BACKUP_BASE_DIR"
     log "💿 Free space: $free_space_human"
@@ -1891,7 +1987,7 @@ do_backup() {
         log "🔄 Incremental: DISABLED (always full backup)"
     fi
     
-    send_ntfy "📅 Time: $start_date\n💻 Host: $hostname\n📁 Source: $SOURCE_DIR\n📊 Size: $source_size_human ($source_files files)\n🐳 Volumes: $volume_count volumes\n💾 Target: $BACKUP_BASE_DIR\n💿 Free space: $free_space_human\n🔒 Encryption: ${ENCRYPTION_CIPHER^^} (Chantik Mode)\n🔑 PBKDF2: ${PBKDF2_ITERATIONS:-600000} iterations\n🔗 Dedup: $([ -n "$FIXED_NONCE" ] && echo "ENABLED" || echo "DISABLED")\n🗜️ Compression: gzip level $GZIP_LEVEL\n📋 Retention: Daily=${RETENTION_DAILY}, Weekly=${RETENTION_WEEKLY}, Monthly=${RETENTION_MONTHLY}\n🔄 Incremental: $([ "$INCREMENTAL_ENABLED" == "true" ] && echo "ENABLED (${FULL_BACKUP_INTERVAL} days)" || echo "DISABLED")" "info"
+    send_ntfy "📅 Time: $start_date\n💻 Host: $hostname\n📁 Source: $SOURCE_DIR\n📊 Size: $source_size_human ($source_files files, $source_dirs directories)\n🐳 Volumes: $volume_count volumes\n💾 Target: $BACKUP_BASE_DIR\n💿 Free space: $free_space_human\n🔒 Encryption: ${ENCRYPTION_CIPHER^^} (Chantik Mode)\n🔑 PBKDF2: ${PBKDF2_ITERATIONS:-600000} iterations\n🔗 Dedup: $([ -n "$FIXED_NONCE" ] && echo "ENABLED" || echo "DISABLED")\n🗜️ Compression: gzip level $GZIP_LEVEL\n📋 Retention: Daily=${RETENTION_DAILY}, Weekly=${RETENTION_WEEKLY}, Monthly=${RETENTION_MONTHLY}\n🔄 Incremental: $([ "$INCREMENTAL_ENABLED" == "true" ] && echo "ENABLED (${FULL_BACKUP_INTERVAL} days)" || echo "DISABLED")" "info"
     acquire_lock
     check_docker
     check_disk_space "$BACKUP_BASE_DIR" 1024
@@ -1907,6 +2003,7 @@ do_backup() {
     local pids=()
     local failed=0
     local vol_count=0
+    local vol_success=0
 
     for vol in "${DOCKER_VOLUMES[@]}"; do
         vol_count=$((vol_count + 1))
@@ -1916,7 +2013,11 @@ do_backup() {
     done
 
     for pid in "${pids[@]}"; do
-        wait $pid || failed=$((failed + 1))
+        if wait $pid; then
+            vol_success=$((vol_success + 1))
+        else
+            failed=$((failed + 1))
+        fi
     done
 
     if [[ $failed -gt 0 ]]; then
@@ -1927,17 +2028,23 @@ do_backup() {
 
     local all_ok=true
     local enc_files=()
+    local verified_count=0
+    local failed_verify=0
+    
     if ls "$backup_dir"/*.enc &>/dev/null; then
         for enc_file in "$backup_dir"/*.enc; do
             enc_files+=("$enc_file")
-            if ! verify_backup "$enc_file"; then
+            if verify_backup "$enc_file"; then
+                verified_count=$((verified_count + 1))
+            else
                 all_ok=false
+                failed_verify=$((failed_verify + 1))
             fi
         done
         if $all_ok; then
-            log "✅ All backups verified."
+            log "✅ All backups verified ($verified_count files)."
         else
-            log "⚠️ WARNING: Some backups failed verification."
+            log "⚠️ WARNING: $failed_verify of $verified_count backups failed verification."
         fi
     else
         log "⚠️ WARNING: No encrypted backup files found in $backup_dir"
@@ -1960,6 +2067,55 @@ do_backup() {
     local space_used_mb=$((free_space_mb - new_free_space_mb))
     local space_used_human=$(human_size $((space_used_mb * 1024 * 1024)))
 
+    local full_count=0
+    local inc_count=0
+    local full_size=0
+    local inc_size=0
+    
+    for enc in "${enc_files[@]}"; do
+        local fname=$(basename "$enc")
+        local fsize=$(stat -c%s "$enc" 2>/dev/null || echo 0)
+        if [[ "$fname" == *_full* ]]; then
+            full_count=$((full_count + 1))
+            full_size=$((full_size + fsize))
+        elif [[ "$fname" == *_inc* ]]; then
+            inc_count=$((inc_count + 1))
+            inc_size=$((inc_size + fsize))
+        fi
+    done
+
+    log_section "📊 BACKUP SUMMARY"
+    log "📂 Location: $backup_dir"
+    log "📁 Directories backed up: $source_dirs"
+    log "📄 Files backed up: $source_files"
+    log "💾 Source size: $source_size_human"
+    log ""
+    log "📦 Backup archives:"
+    log "   FULL backups:      $full_count file(s) ($(human_size $full_size))"
+    log "   INCREMENTAL backups: $inc_count file(s) ($(human_size $inc_size))"
+    log "   Total:             $backup_count file(s) ($total_backup_size_human)"
+    log ""
+    log "🔐 Verification:"
+    if [[ $failed_verify -eq 0 ]] && [[ $backup_count -gt 0 ]]; then
+        log "   ✅ All $verified_count backup(s) verified successfully"
+    elif [[ $backup_count -gt 0 ]]; then
+        log "   ⚠️  $failed_verify of $verified_count backup(s) failed verification"
+    else
+        log "   ⚠️  No backups to verify"
+    fi
+    log ""
+    log "💿 Storage:"
+    log "   Before: $free_space_human"
+    log "   Used:   $space_used_human"
+    log "   After:  $(human_size $((new_free_space_mb * 1024 * 1024)))"
+    log ""
+    if [[ "$INCREMENTAL_ENABLED" == "true" ]]; then
+        log "🔄 Incremental mode:"
+        log "   Full backup interval: ${FULL_BACKUP_INTERVAL} days"
+        log "   Next full backup due: $(date -d "+${FULL_BACKUP_INTERVAL} days" '+%Y-%m-%d' 2>/dev/null || echo "unknown")"
+    fi
+    log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
     log_section "✅ Backup completed successfully"
     log "🕊️ $BRAND_NAME — $BRAND_TAGLINE"
     log "⏱️ Duration: $duration_human"
@@ -1969,10 +2125,8 @@ do_backup() {
     log "📝 Log: $LOG_FILE"
     log "🙏 $BRAND_MOTTO"
 
-    local full_count=$(find "$backup_dir" -name "*_full*.enc" 2>/dev/null | wc -l)
-    local inc_count=$(find "$backup_dir" -name "*_inc*.enc" 2>/dev/null | wc -l)
+    send_ntfy "📅 Completed: $end_date\n⏱️ Duration: $duration_human\n📦 Archives: $backup_count encrypted files\n   FULL: $full_count ($(human_size $full_size))\n   INC:  $inc_count ($(human_size $inc_size))\n📁 Source: $source_files files, $source_dirs dirs\n💾 Source size: $source_size_human\n🐳 Volumes: $volume_count volumes (${vol_success} successful)\n🔒 Encryption: ${ENCRYPTION_CIPHER^^} (Chantik Mode)\n🔑 PBKDF2: ${PBKDF2_ITERATIONS:-600000} iterations\n🔗 Dedup: $([ -n "$FIXED_NONCE" ] && echo "ENABLED" || echo "DISABLED")\n🔐 Verification: $([ $failed_verify -eq 0 ] && echo "✅ ALL PASSED" || echo "⚠️ $failed_verify FAILED")\n📋 Retention: D${RETENTION_DAILY}/W${RETENTION_WEEKLY}/M${RETENTION_MONTHLY}\n💿 Free space: $free_space_human → $(human_size $((new_free_space_mb * 1024 * 1024))) (used $space_used_human)\n📂 Location: $backup_dir" "success"
     
-    send_ntfy "📅 Completed: $end_date\n⏱️ Duration: $duration_human\n📦 Archives: $backup_count encrypted files ($full_count full, $inc_count incremental)\n💾 Total size: $total_backup_size_human\n📁 Source size: $source_size_human ($source_files files)\n🐳 Volumes: $volume_count volumes\n💿 Free space: $free_space_human → $(human_size $((new_free_space_mb * 1024 * 1024))) (used $space_used_human)\n🔒 Verification: ✅ All checksums verified\n🗑️ Retention: Daily=${RETENTION_DAILY}, Weekly=${RETENTION_WEEKLY}, Monthly=${RETENTION_MONTHLY}\n🔗 Deduplication: $([ -n "$FIXED_NONCE" ] && echo "ENABLED" || echo "DISABLED")\n🔄 Incremental: $([ "$INCREMENTAL_ENABLED" == "true" ] && echo "ENABLED (${FULL_BACKUP_INTERVAL} days)" || echo "DISABLED")\n📍 Location: $backup_dir\n📝 Log: $LOG_FILE" "success"
     release_lock
     cleanup_temp
     log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
