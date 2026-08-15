@@ -33,19 +33,21 @@
 
 > **Chantik** — A robust backup solution originally created for the [digital-independence](https://github.com/ricalnet/digital-independence) project, now available for general use. Chantik provides protection with ChaCha20-Poly1305 authenticated encryption, smart retention policies, and comprehensive automation features.
 
+### ✨ Key Features
+
 | Feature | Description |
 |---------|-------------|
-| 🔐 Encryption | ChaCha20-Poly1305 (primary) with AES-256-CBC fallback |
-| 🔑 Key Derivation | PBKDF2 with configurable iterations (default: 600,000) |
+| 🔐 Authenticated Encryption | ChaCha20-Poly1305 (primary) with AES-256-CBC fallback |
+| 🔑 Strong Key Derivation | PBKDF2 with configurable iterations (default: 600,000) |
 | 🔗 Deduplication | Fixed nonce support for deterministic encryption |
 | 🗜️ Compression | Gzip with configurable levels (1-9) |
-| 🐳 Docker Support | Backup Docker volumes seamlessly |
+| 🐳 Docker Support | Seamless backup and restore of Docker volumes |
 | 🔄 Incremental Backups | Save storage and speed up backups |
 | 📊 Smart Retention | Daily, weekly, and monthly retention policies |
-| 🔔 Notifications | Real-time alerts via ntfy.sh |
-| ✅ Verification | SHA256 checksum verification |
-| 🔒 Security | Configurable permissions and locking |
-| 📝 Logging | Detailed logs for auditing |
+| 🔔 Real-time Notifications | Instant alerts via ntfy.sh |
+| ✅ Integrity Verification | SHA256 checksum verification for every backup |
+| 🔒 Security | Configurable permissions and process locking |
+| 📝 Comprehensive Logging | Detailed logs for auditing and troubleshooting |
 
 ## 🚀 Quick Start
 
@@ -68,23 +70,6 @@ Ensure your system has:
 - du
 - hostname
 - sha256sum
-```
-
-Install missing packages:
-
-```bash
-# Ubuntu/Debian
-sudo apt update
-sudo apt install -y openssl gzip tar curl coreutils
-
-# RHEL/CentOS/Fedora
-sudo yum install -y openssl gzip tar curl coreutils
-
-# Alpine Linux
-apk add openssl gzip tar curl coreutils
-
-# macOS (using Homebrew)
-brew install openssl gzip tar curl coreutils
 ```
 
 ### Installation
@@ -133,49 +118,24 @@ brew install openssl gzip tar curl coreutils
 # Perform backup
 sudo ./chantik.sh
 
-# Watch the output:
+# Example output:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [2026-08-08 10:00:00] 🕊️ Starting Chantik (v0.1.1)
 [2026-08-08 10:00:00] 💬 ChaCha20-Authenticated Backup Protection
 [2026-08-08 10:00:00] 🙏 In ChaCha We Trust — Authentically Secured
 [2026-08-08 10:00:00] 
-✅ Configuration loaded successfully from: /path/to/chantik.conf
+✅ Configuration loaded successfully
 [2026-08-08 10:00:00] 📁 Source: /home/user/digital-independence
 [2026-08-08 10:00:00] 📊 Size: 156.2 MB (1,234 files)
-[2026-08-08 10:00:00] 🐳 Volumes: 3 volumes
-[2026-08-08 10:00:00] 💾 Target: /media/backup
-[2026-08-08 10:00:00] 💿 Free space: 450.5 GB
-[2026-08-08 10:00:00] 🔒 Encryption: CHACHA20 (Chantik Mode — ChaCha Autentik)
-[2026-08-08 10:00:00] 🔑 PBKDF2 iterations: 600000
-[2026-08-08 10:00:00] 🔗 Deduplication: ENABLED (fixed nonce)
-[2026-08-08 10:00:00] 🗜️ Compression: gzip level 6
-[2026-08-08 10:00:00] 📋 Retention: Daily=7, Weekly=4, Monthly=6
-[2026-08-08 10:00:00] 🔄 Incremental: ENABLED (full backup every 7 days)
-[2026-08-08 10:00:00] 📂 Backup directory created: /media/backup/chantik-backup_20260808_100000
-[2026-08-08 10:00:01] 📦 Performing FULL backup of /home/user/digital-independence (scheduled full backup)
-[2026-08-08 10:00:30] 🗜️ Compressing with gzip level 6...
+[2026-08-08 10:00:00] 🔒 Encryption: CHACHA20
+[2026-08-08 10:00:00] 📦 Performing FULL backup...
 [2026-08-08 10:00:45] ✅ FULL encrypted backup created: digital-independence_20260808_100000_full.tar.gz.enc (28.3 MB)
-[2026-08-08 10:00:45] 📦 Performing FULL backup of Docker volume: postgres_data (scheduled full backup)
-[2026-08-08 10:01:15] ✅ FULL encrypted volume backup created: volume_postgres_data_20260808_100000_full.tar.gz.enc (85.6 MB)
-[2026-08-08 10:01:15] 📦 Performing INCREMENTAL backup of Docker volume: redis_cache (since 2026-08-07 10:00:00)
-[2026-08-08 10:01:30] 📊 Changed files in volume: 15
-[2026-08-08 10:01:30] ✅ INCREMENTAL encrypted volume backup created: volume_redis_cache_20260808_100000_inc.tar.gz.enc (3.2 MB)
-[2026-08-08 10:01:30] ✅ All backups verified.
-[2026-08-08 10:01:30] Rotating backups in /media/backup
-[2026-08-08 10:01:31] ✅ Rotation completed
-[2026-08-08 10:01:31] 🔗 Running deduplication on /media/backup using hardlink...
-[2026-08-08 10:01:35] ✅ Deduplication complete: 456 .enc files processed (4s)
-[2026-08-08 10:01:35] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [2026-08-08 10:01:35] ✅ Backup completed successfully
-[2026-08-08 10:01:35] 🕊️ Chantik — ChaCha20-Authenticated Backup Protection
 [2026-08-08 10:01:35] ⏱️ Duration: 1m 35s
-[2026-08-08 10:01:35] 📦 Archives: 12 encrypted files (3 full, 9 incremental)
+[2026-08-08 10:01:35] 📦 Archives: 12 encrypted files
 [2026-08-08 10:01:35] 💾 Total size: 117.1 MB
 [2026-08-08 10:01:35] 📍 Location: /media/backup/chantik-backup_20260808_100000
-[2026-08-08 10:01:35] 📝 Log: /path/to/chantik.log
 [2026-08-08 10:01:35] 🙏 In ChaCha We Trust — Authentically Secured
-[2026-08-08 10:01:35] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-[2026-08-08 10:01:35] 🕊️ Chantik — From ChaCha Comes Peace of Mind
 ```
 
 ## 📋 Configuration Guide
@@ -189,13 +149,13 @@ sudo ./chantik.sh
 | `DOCKER_VOLUMES` | Array of Docker volume names | `("postgres_data" "redis_cache")` |
 | `ENCRYPTION_KEY_FILE` | Path to encryption key | `/home/user/chantik/encryption.key` |
 | `NTFY_TOPIC` | ntfy.sh topic for notifications | `my-backup-topic` |
-| `NTFY_TOKEN` | ntfy.sh authentication token | `tk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx` |
+| `NTFY_TOKEN` | ntfy.sh authentication token | `tk_xxxxxxxxxxxxxxxx` |
 
 ### Advanced Configuration
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `ENCRYPTION_CIPHER` | Cipher to use (chacha20 or aes-256-cbc) | `chacha20` (auto-detected) |
+| `ENCRYPTION_CIPHER` | Cipher to use (auto-detected) | `chacha20` |
 | `PBKDF2_ITERATIONS` | Key derivation iterations (100,000+) | `600000` |
 | `FIXED_SALT_FILE` | Fixed salt for deterministic encryption | (optional) |
 | `INCREMENTAL_ENABLED` | Enable incremental backups | `true` |
@@ -204,53 +164,63 @@ sudo ./chantik.sh
 | `RETENTION_WEEKLY` | Number of weekly backups to keep | `4` |
 | `RETENTION_MONTHLY` | Number of monthly backups to keep | `6` |
 | `GZIP_LEVEL` | Compression level (1-9) | `6` |
-| `DEDUP_TOOL` | Deduplication tool (hardlink, jdupes, or "") | `hardlink` |
+| `DEDUP_TOOL` | Deduplication tool | `hardlink` |
 | `VERBOSE` | Enable detailed debug output | `false` |
 | `MAX_BACKUP_SIZE_MB` | Maximum backup size limit | `0` (unlimited) |
 | `EXCLUDE_PATTERNS` | Files/directories to exclude | `*.tmp,*.log` |
+| `NTFY_CUSTOM_SERVER` | Custom ntfy server URL | (empty) |
 
 ### Configuration Examples
 
-#### Enable Deduplication
-- Generate fixed salt
-  ```bash
-  openssl rand -hex 8 > fixed_salt.txt
-  chmod 600 fixed_salt.txt
-  ```
+<details>
+<summary><b>Enable Deduplication</b></summary>
 
-- In `chantik.conf`:
-  ```bash
-  FIXED_SALT_FILE="/path/to/fixed_salt.txt"
-  DEDUP_TOOL="hardlink"
-  ```
+Generate fixed salt:
+```bash
+openssl rand -hex 8 > fixed_salt.txt
+chmod 600 fixed_salt.txt
+```
 
-#### Disable Incremental Backups
-- In `chantik.conf`:
-  ```bash
-  INCREMENTAL_ENABLED=false
-  ```
+In `chantik.conf`:
+```bash
+FIXED_SALT_FILE="/path/to/fixed_salt.txt"
+DEDUP_TOOL="hardlink"
+```
+</details>
 
-#### Custom ntfy Server
-- In `chantik.conf`:
-  ```bash
-  NTFY_CUSTOM_SERVER="https://your-ntfy-server.com"
-  ```
+<details>
+<summary><b>Disable Incremental Backups</b></summary>
+
+In `chantik.conf`:
+```bash
+INCREMENTAL_ENABLED=false
+```
+</details>
+
+<details>
+<summary><b>Custom ntfy Server</b></summary>
+
+In `chantik.conf`:
+```bash
+NTFY_CUSTOM_SERVER="https://your-ntfy-server.com"
+```
+</details>
 
 ## 🔄 Command Reference
 
 ### Basic Commands
 
 ```bash
-# Perform a full or incremental backup
+# Perform a backup (full or incremental based on configuration)
 ./chantik.sh
 
-# Test encryption/decryption
+# Test encryption/decryption system
 ./chantik.sh --test
 
 # List all available backups
 ./chantik.sh --list
 
-# Verify a specific backup
+# Verify a specific backup's integrity
 ./chantik.sh --verify /path/to/backup.enc
 
 # Verify all backups
@@ -274,19 +244,8 @@ chantik-backup_YYYYMMDD_HHMMSS/
 ├── digital-independence_YYYYMMDD_HHMMSS_inc.tar.gz.enc      # Incremental backup
 ├── volume_postgres_data_YYYYMMDD_HHMMSS_full.tar.gz.enc     # Full volume backup
 ├── volume_redis_cache_YYYYMMDD_HHMMSS_inc.tar.gz.enc        # Incremental volume backup
-
-├── chantik-backup_YYYYMMDD_HHMM01/
-│   ├── digital-independence_full.tar.gz.enc                 # Full backup
-│   ├── volume_postgres_data_full.tar.gz.enc                 # Full backup
-│   ├── volume_redis_cache_full.tar.gz.enc                   # Full backup
-│   ├── *.checksums                                          # SHA256 checksums
-│   ├── *.enc.checksums                                      # Encrypted file checksums
-├── chantik-backup_YYYYMMDD_HHMM09/
-│   ├── digital-independence_inc.tar.gz.enc                  # Incremental backup
-│   ├── volume_postgres_data_inc.tar.gz.enc                  # Incremental volume backup
-│   ├── volume_redis_cache_inc.tar.gz.enc                    # Incremental volume backup
-│   ├── *.checksums                                          # SHA256 checksums
-│   ├── *.enc.checksums                                      # Encrypted file checksums
+├── *.checksums                                              # SHA256 checksums
+└── *.enc.checksums                                          # Encrypted file checksums
 ```
 
 ## 🔐 Security
@@ -323,7 +282,7 @@ openssl rand -hex 8 > fixed_salt.txt
 chmod 600 fixed_salt.txt
 ```
 
-Backup encryption key separately:
+Backup encryption key separately (GPG):
 ```bash
 gpg -c encryption.key
 ```
@@ -335,8 +294,8 @@ Chantik integrates with [ntfy.sh](https://ntfy.sh/) for real-time notifications.
 ### Setting Up Notifications
 
 1. Get ntfy token: Visit https://ntfy.sh/account
-2. Choose a topic: Any unique name, e.g., `my-backup-topic`
-3. Configure in chantik.conf:
+2. Choose a unique topic name
+3. Configure in `chantik.conf`:
    ```bash
    NTFY_TOPIC="my-backup-topic"
    NTFY_TOKEN="tk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
@@ -355,11 +314,11 @@ Chantik integrates with [ntfy.sh](https://ntfy.sh/) for real-time notifications.
 
 Chantik uses a smart retention policy:
 
-1. Daily backups: Keep last 7 days
-2. Weekly backups: Keep last 4 weeks (one per week)
-3. Monthly backups: Keep last 6 months (one per month)
+1. Daily backups: Keep last `RETENTION_DAILY` days (default: 7)
+2. Weekly backups: Keep last `RETENTION_WEEKLY` weeks (default: 4)
+3. Monthly backups: Keep last `RETENTION_MONTHLY` months (default: 6)
 
-### Rotation Logic
+### Retention Logic
 
 ```bash
 # Example retention timeline
@@ -395,16 +354,14 @@ volume_redis_cache_20260808_100000_inc.tar.gz.enc
 
 ```bash
 # Restore a Docker volume
-./chantik.sh --restore /media/backup/chantik-backup_20260808_100000/volume_postgres_data_20260808_100000_full.tar.gz.enc
+./chantik.sh --restore /media/backup/volume_postgres_data_20260808_100000_full.tar.gz.enc
 
 # Output:
 [2026-08-08 10:30:00] 🦑 Restoring type: volume_postgres_data
-[2026-08-08 10:30:00] 🔐 Decrypting volume_postgres_data_20260808_100000_full.tar.gz.enc...
+[2026-08-08 10:30:00] 🔐 Decrypting...
 [2026-08-08 10:30:05] ✅ Checksum verification passed.
-[2026-08-08 10:30:05] 📦 Decompressing...
 [2026-08-08 10:30:10] 📦 Restoring Docker volume: postgres_data
 [2026-08-08 10:30:15] ✅ Volume restore completed for postgres_data
-[2026-08-08 10:30:15] ✅ Restore completed successfully.
 ```
 
 ## 🤖 Automation
@@ -438,10 +395,11 @@ sudo crontab -e
 
 ### Common Issues
 
-ChaCha20 not supported (script will automatically fallback to AES-256-CBC):
+ChaCha20 not supported:
 ```bash
 ⚠️ WARNING: ChaCha20-Poly1305 not supported; falling back to AES-256-CBC.
 ```
+*The script will automatically use AES-256-CBC as a fallback.*
 
 Insufficient disk space:
 ```bash
@@ -451,6 +409,12 @@ df -h /media/backup
 # Reduce retention or increase storage
 RETENTION_DAILY=3
 RETENTION_WEEKLY=2
+```
+
+Lock file error:
+```bash
+# If a previous backup was interrupted
+rm /path/to/chantik/.chantik.lock
 ```
 
 ### Debug Mode
@@ -500,6 +464,19 @@ Compress more aggressively:
 ```bash
 GZIP_LEVEL=9
 ```
+
+## 🧪 Testing
+
+Run the complete test suite:
+```bash
+./chantik.sh --test
+```
+
+The test suite verifies:
+- ChaCha20 encryption/decryption
+- AES-256-CBC fallback
+- PBKDF2 compatibility
+- Fixed nonce deduplication
 
 ## 🙏 Acknowledgements
 
