@@ -1,28 +1,70 @@
 #!/usr/bin/env bash
-#
-# chantik.sh - 🕊️ ChaCha20-Authenticated Backup Protection
-# Backup solution for directories and Docker volumes
-# with ChaCha20-Poly1305 encryption, compression, smart retention, 
-# incremental backups, deduplication, and real-time notifications.
-#
-# Security: All sensitive configuration is stored in chantik.conf
-#           which should be excluded from version control.
 
 set -euo pipefail
 IFS=$'\n\t'
 
-VERSION="0.1.1"
+VERSION="0.1.4"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 
-# -----------------------------------------------------------------------------
-# Global Settings
-# -----------------------------------------------------------------------------
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_FILE="${SCRIPT_DIR}/chantik.conf"
+if [[ -n "${BASH_SOURCE[0]}" ]]; then
+    SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+else
+    SCRIPT_SOURCE="$0"
+fi
+
+if command -v realpath &>/dev/null; then
+    SCRIPT_PATH="$(realpath "$SCRIPT_SOURCE" 2>/dev/null || echo "$SCRIPT_SOURCE")"
+elif command -v readlink &>/dev/null; then
+    SCRIPT_PATH="$(readlink -f "$SCRIPT_SOURCE" 2>/dev/null || echo "$SCRIPT_SOURCE")"
+else
+    SCRIPT_PATH="$SCRIPT_SOURCE"
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+
+if [[ -n "${CHANTIK_CONFIG:-}" ]]; then
+    CONFIG_FILE="${CHANTIK_CONFIG}"
+else
+    CONFIG_FILE="${SCRIPT_DIR}/chantik.conf"
+fi
+
+if [[ ! -f "$CONFIG_FILE" ]] && [[ -n "${XDG_CONFIG_HOME:-}" ]]; then
+    XDG_CONFIG_FILE="${XDG_CONFIG_HOME}/chantik/chantik.conf"
+    if [[ -f "$XDG_CONFIG_FILE" ]]; then
+        CONFIG_FILE="$XDG_CONFIG_FILE"
+    fi
+fi
+
+if [[ ! -f "$CONFIG_FILE" ]] && [[ -f "/etc/chantik/chantik.conf" ]]; then
+    CONFIG_FILE="/etc/chantik/chantik.conf"
+fi
+
 CONFIG_EXAMPLE="${SCRIPT_DIR}/chantik.conf.example"
-LOCK_FILE="${SCRIPT_DIR}/.chantik.lock"
-LOG_FILE="${SCRIPT_DIR}/chantik.log"
-TMP_DIR="${SCRIPT_DIR}/.tmp"
+
+if [[ -n "${CHANTIK_WORK_DIR:-}" ]]; then
+    WORK_DIR="${CHANTIK_WORK_DIR}"
+else
+    WORK_DIR="${SCRIPT_DIR}"
+fi
+
+LOCK_FILE="${WORK_DIR}/.chantik.lock"
+LOG_FILE="${WORK_DIR}/chantik.log"
+TMP_DIR="${WORK_DIR}/.tmp"
+
+if [[ ! -w "$WORK_DIR" ]]; then
+    if [[ -n "${XDG_STATE_HOME:-}" ]]; then
+        WORK_DIR="${XDG_STATE_HOME}/chantik"
+    elif [[ -n "${HOME:-}" ]]; then
+        WORK_DIR="${HOME}/.local/state/chantik"
+    else
+        WORK_DIR="/tmp/chantik-$$"
+    fi
+    mkdir -p "$WORK_DIR" 2>/dev/null || true
+    LOCK_FILE="${WORK_DIR}/.chantik.lock"
+    LOG_FILE="${WORK_DIR}/chantik.log"
+    TMP_DIR="${WORK_DIR}/.tmp"
+fi
+
 BACKUP_START_TIME=0
 BACKUP_END_TIME=0
 BRAND_NAME="Chantik"
@@ -30,10 +72,11 @@ BRAND_TAGLINE="ChaCha20-Authenticated Backup Protection"
 BRAND_MOTTO="In ChaCha We Trust — Authentically Secured"
 BRAND_EMOJI="🕊️"
 
-# Default values (will be overridden by config)
 BACKUP_BASE_DIR=""
 SOURCE_DIR=""
 DOCKER_VOLUMES=()
+PODMAN_VOLUMES=()
+CONTAINER_RUNTIME="auto"
 NTFY_TOPIC=""
 NTFY_TOKEN=""
 RETENTION_DAILY=7
@@ -54,6 +97,172 @@ INCREMENTAL_ENABLED="true"
 INCREMENTAL_BASE_DIR="${BACKUP_BASE_DIR}/.incremental"
 SNAPSHOT_FILE=""
 FULL_BACKUP_INTERVAL=7
+
+detect_container_runtime() {
+    local runtime=""
+    
+    if [[ -n "$CONTAINER_RUNTIME" ]] && [[ "$CONTAINER_RUNTIME" != "auto" ]]; then
+        runtime="$CONTAINER_RUNTIME"
+    else
+        if command -v podman &> /dev/null && podman info &> /dev/null 2>&1; then
+            runtime="podman"
+        elif command -v docker &> /dev/null && docker info &> /dev/null 2>&1; then
+            runtime="docker"
+        else
+            error_exit "No container runtime found. Install Docker or Podman."
+        fi
+    fi
+    
+    if [[ "$runtime" == "podman" ]]; then
+        if ! command -v podman &> /dev/null; then
+            error_exit "Podman not found in PATH"
+        fi
+        if ! podman info &> /dev/null 2>&1; then
+            error_exit "Podman daemon is not running or not accessible"
+        fi
+        log_verbose "Using Podman container runtime"
+    elif [[ "$runtime" == "docker" ]]; then
+        if ! command -v docker &> /dev/null; then
+            error_exit "Docker not found in PATH"
+        fi
+        if ! docker info &> /dev/null 2>&1; then
+            error_exit "Docker daemon is not running or not accessible"
+        fi
+        log_verbose "Using Docker container runtime"
+    else
+        error_exit "Invalid container runtime: $runtime. Use 'docker', 'podman', or 'auto'"
+    fi
+    
+    echo "$runtime"
+}
+
+check_container_runtime() {
+    local runtime=$(detect_container_runtime)
+    CONTAINER_RUNTIME="$runtime"
+    
+    if [[ "$runtime" == "podman" ]]; then
+        log_verbose "✅ Podman is running"
+        if podman info --format '{{.Store.Rootless}}' 2>/dev/null | grep -q "true"; then
+            log_verbose "Podman running in rootless mode"
+            CONTAINER_ROOTLESS=true
+        else
+            log_verbose "Podman running in rootful mode"
+            CONTAINER_ROOTLESS=false
+        fi
+    else
+        log_verbose "✅ Docker is running"
+        if docker info 2>/dev/null | grep -q "rootless"; then
+            log_verbose "Docker running in rootless mode"
+            CONTAINER_ROOTLESS=true
+        else
+            CONTAINER_ROOTLESS=false
+        fi
+    fi
+}
+
+list_container_volumes() {
+    local runtime="$1"
+    local volumes=()
+    
+    if [[ "$runtime" == "podman" ]]; then
+        while IFS= read -r vol; do
+            if [[ -n "$vol" ]]; then
+                volumes+=("$vol")
+            fi
+        done < <(podman volume ls --format '{{.Name}}' 2>/dev/null)
+    else
+        while IFS= read -r vol; do
+            if [[ -n "$vol" ]]; then
+                volumes+=("$vol")
+            fi
+        done < <(docker volume ls --format '{{.Name}}' 2>/dev/null)
+    fi
+    
+    printf '%s\n' "${volumes[@]}"
+}
+
+volume_exists() {
+    local runtime="$1"
+    local volume="$2"
+    
+    if [[ "$runtime" == "podman" ]]; then
+        podman volume inspect "$volume" &>/dev/null
+    else
+        docker volume inspect "$volume" &>/dev/null
+    fi
+}
+
+create_snapshot_volume() {
+    local runtime="$1"
+    local source_volume="$2"
+    local snapshot_volume="$3"
+    
+    if volume_exists "$runtime" "$snapshot_volume"; then
+        if [[ "$runtime" == "podman" ]]; then
+            podman volume rm "$snapshot_volume" 2>/dev/null || true
+        else
+            docker volume rm "$snapshot_volume" 2>/dev/null || true
+        fi
+    fi
+    
+    if [[ "$runtime" == "podman" ]]; then
+        podman volume create "$snapshot_volume" || error_exit "Failed to create snapshot volume"
+    else
+        docker volume create "$snapshot_volume" || error_exit "Failed to create snapshot volume"
+    fi
+}
+
+run_container() {
+    local runtime="$1"
+    local container_name="$2"
+    local image="$3"
+    shift 3
+    
+    if [[ "$runtime" == "podman" ]]; then
+        podman run --rm --name "$container_name" "$@" "$image"
+    else
+        docker run --rm --name "$container_name" "$@" "$image"
+    fi
+}
+
+run_container_detached() {
+    local runtime="$1"
+    local container_name="$2"
+    local image="$3"
+    shift 3
+    
+    if [[ "$runtime" == "podman" ]]; then
+        podman run -d --name "$container_name" "$@" "$image"
+    else
+        docker run -d --name "$container_name" "$@" "$image"
+    fi
+}
+
+stop_container() {
+    local runtime="$1"
+    local container_name="$2"
+    
+    if [[ "$runtime" == "podman" ]]; then
+        podman stop "$container_name" >/dev/null 2>&1 || true
+        podman rm "$container_name" >/dev/null 2>&1 || true
+    else
+        docker stop "$container_name" >/dev/null 2>&1 || true
+        docker rm "$container_name" >/dev/null 2>&1 || true
+    fi
+}
+
+copy_to_volume() {
+    local runtime="$1"
+    local container_name="$2"
+    local source_path="$3"
+    local dest_path="$4"
+    
+    if [[ "$runtime" == "podman" ]]; then
+        podman cp "$source_path" "$container_name:$dest_path" 2>/dev/null
+    else
+        docker cp "$source_path" "$container_name:$dest_path" 2>/dev/null
+    fi
+}
 
 check_chacha20_support() {
     if openssl enc -chacha20 -help 2>&1 | grep -q "unknown option"; then
@@ -76,6 +285,9 @@ load_config() {
         echo "  2. Edit $CONFIG_FILE with your values"
         echo "  3. Never commit $CONFIG_FILE to version control"
         echo ""
+        echo "Alternatively, set CHANTIK_CONFIG environment variable:"
+        echo "     export CHANTIK_CONFIG=/path/to/chantik.conf"
+        echo ""
         exit 1
     fi
 
@@ -84,7 +296,6 @@ load_config() {
     local required_vars=(
         "BACKUP_BASE_DIR"
         "SOURCE_DIR"
-        "DOCKER_VOLUMES"
         "ENCRYPTION_KEY_FILE"
         "NTFY_TOPIC"
         "NTFY_TOKEN"
@@ -94,10 +305,17 @@ load_config() {
     for var in "${required_vars[@]}"; do
         if [[ -z "${!var:-}" ]]; then
             missing_vars+=("$var")
-        elif [[ "$var" == "DOCKER_VOLUMES" ]] && [[ ${#DOCKER_VOLUMES[@]} -eq 0 ]]; then
-            missing_vars+=("$var (empty array)")
         fi
     done
+
+    local has_volumes=false
+    if [[ ${#DOCKER_VOLUMES[@]} -gt 0 ]] || [[ ${#PODMAN_VOLUMES[@]} -gt 0 ]]; then
+        has_volumes=true
+    fi
+
+    if [[ "$has_volumes" == "false" ]]; then
+        missing_vars+=("DOCKER_VOLUMES or PODMAN_VOLUMES (both empty)")
+    fi
 
     if [[ ${#missing_vars[@]} -gt 0 ]]; then
         echo "🕊️ ERROR: Missing required configuration variables in $CONFIG_FILE:"
@@ -107,18 +325,28 @@ load_config() {
         exit 1
     fi
 
+    if [[ "$BACKUP_BASE_DIR" != /* ]]; then
+        BACKUP_BASE_DIR="${SCRIPT_DIR}/${BACKUP_BASE_DIR}"
+    fi
+    
+    if [[ "$SOURCE_DIR" != /* ]]; then
+        SOURCE_DIR="${SCRIPT_DIR}/${SOURCE_DIR}"
+    fi
+    
+    if [[ "$ENCRYPTION_KEY_FILE" != /* ]]; then
+        ENCRYPTION_KEY_FILE="${SCRIPT_DIR}/${ENCRYPTION_KEY_FILE}"
+    fi
+
     INCREMENTAL_ENABLED="${INCREMENTAL_ENABLED:-false}"
     FULL_BACKUP_INTERVAL="${FULL_BACKUP_INTERVAL:-7}"
     INCREMENTAL_BASE_DIR="${BACKUP_BASE_DIR}/.incremental"
 
     if [[ -n "${PBKDF2_ITERATIONS:-}" ]]; then
         if [[ ! "$PBKDF2_ITERATIONS" =~ ^[0-9]+$ ]] || [[ "$PBKDF2_ITERATIONS" -lt 100000 ]]; then
-            echo "⚠️ WARNING: PBKDF2_ITERATIONS must be a number >= 100000."
-            echo "   Using default: 600000"
+            echo "⚠️ WARNING: PBKDF2_ITERATIONS must be >= 100000. Using default: 600000"
             PBKDF2_ITERATIONS=600000
         elif [[ "$PBKDF2_ITERATIONS" -lt 600000 ]]; then
             echo "⚠️ WARNING: PBKDF2_ITERATIONS=$PBKDF2_ITERATIONS is lower than recommended (600000+)."
-            echo "   Consider increasing for better security."
         fi
         log_verbose "PBKDF2 iterations: $PBKDF2_ITERATIONS"
     else
@@ -132,7 +360,6 @@ load_config() {
     else
         ENCRYPTION_CIPHER="aes-256-cbc"
         echo "⚠️ WARNING: ChaCha20-Poly1305 not supported; falling back to AES-256-CBC."
-        echo "   This may be slower on this system."
     fi
 
     if [[ ! -f "$ENCRYPTION_KEY_FILE" ]]; then
@@ -168,6 +395,9 @@ load_config() {
     fi
 
     if [[ -n "$FIXED_SALT_FILE" ]]; then
+        if [[ "$FIXED_SALT_FILE" != /* ]]; then
+            FIXED_SALT_FILE="${SCRIPT_DIR}/${FIXED_SALT_FILE}"
+        fi
         if [[ ! -f "$FIXED_SALT_FILE" ]]; then
             echo "🕊️ ERROR: Fixed salt file not found: $FIXED_SALT_FILE"
             echo "Generate a fixed salt (16 hex chars) with:"
@@ -213,13 +443,19 @@ load_config() {
             missing_tools+=("$tool")
         fi
     done
+    
+    if [[ -z "${CONTAINER_RUNTIME:-}" ]] || [[ "$CONTAINER_RUNTIME" == "auto" ]]; then
+        CONTAINER_RUNTIME=$(detect_container_runtime)
+    fi
+    
     if [[ ${#missing_tools[@]} -gt 0 ]]; then
         echo "🕊️ ERROR: Required tools not found: ${missing_tools[*]}"
         echo "Please install them and try again."
         exit 1
     fi
 
-    echo "✅ Configuration loaded successfully from: $CONFIG_FILE"
+    echo "✅ Config loaded: $CONFIG_FILE"
+    echo "✅ Runtime: $CONTAINER_RUNTIME"
 }
 
 init_tmp() {
@@ -257,7 +493,7 @@ send_ntfy() {
     local status="${2:-info}"
     
     if [[ -z "$NTFY_TOPIC" || -z "$NTFY_TOKEN" ]]; then
-        log_verbose "ntfy not configured (topic/token missing). Skipping notification."
+        log_verbose "ntfy not configured. Skipping notification."
         return 0
     fi
     
@@ -421,33 +657,38 @@ check_backup_size() {
     fi
 }
 
-check_docker() {
-    if ! command -v docker &> /dev/null; then
-        error_exit "Docker is not installed or not in PATH"
-    fi
-    if ! docker info &> /dev/null; then
-        error_exit "Docker daemon is not running"
-    fi
-    log_verbose "Docker is running"
-}
-
 acquire_lock() {
-    if [[ -f "$LOCK_FILE" ]]; then
-        local pid
-        pid=$(cat "$LOCK_FILE" 2>/dev/null || echo "")
-        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-            error_exit "Another backup process is running (PID $pid). Lock file exists."
+    local lock_dir="${LOCK_FILE}.dir"
+    
+    if ! mkdir "$lock_dir" 2>/dev/null; then
+        if [[ -f "${lock_dir}/pid" ]]; then
+            local pid=$(cat "${lock_dir}/pid" 2>/dev/null || echo "")
+            if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                error_exit "Another backup process is running (PID $pid). Lock directory exists."
+            else
+                log "Stale lock found. Removing."
+                rm -rf "$lock_dir"
+                if ! mkdir "$lock_dir" 2>/dev/null; then
+                    error_exit "Failed to acquire lock after cleanup"
+                fi
+            fi
         else
-            log "Stale lock file found. Removing."
-            rm -f "$LOCK_FILE"
+            error_exit "Lock directory exists but no PID file. Manual cleanup needed: rm -rf $lock_dir"
         fi
     fi
-    echo $$ > "$LOCK_FILE"
-    trap 'rm -f "$LOCK_FILE"; cleanup_temp; exit' INT TERM EXIT
+    
+    echo $$ > "${lock_dir}/pid"
+    echo "$(date '+%Y-%m-%d %H:%M:%S')" > "${lock_dir}/timestamp"
+    
+    LOCK_DIR="$lock_dir"
+    
+    trap 'rm -rf "$LOCK_DIR"; cleanup_temp; exit' INT TERM EXIT
 }
 
 release_lock() {
-    rm -f "$LOCK_FILE" 2>/dev/null || true
+    if [[ -n "${LOCK_DIR:-}" ]] && [[ -d "$LOCK_DIR" ]]; then
+        rm -rf "$LOCK_DIR" 2>/dev/null || true
+    fi
     trap - INT TERM EXIT
 }
 
@@ -458,6 +699,101 @@ cleanup_temp() {
     find "$TMP_DIR" -type d -name "verify_test_*" -exec rm -rf {} + 2>/dev/null || true
     find "$TMP_DIR" -type d -name "restore_*" -exec rm -rf {} + 2>/dev/null || true
     find "$TMP_DIR" -type f -mtime +1 -delete 2>/dev/null || true
+}
+
+setup_secure_staging() {
+    local prefix="${1:-restore}"
+    
+    local staging_dir
+    if ! staging_dir=$(mktemp -d -p "$TMP_DIR" "${prefix}_XXXXXX" 2>/dev/null); then
+        staging_dir="${TMP_DIR}/${prefix}_$$_$RANDOM"
+        mkdir -p "$staging_dir"
+    fi
+    
+    chmod 700 "$staging_dir"
+    
+    cleanup_staging() {
+        if [[ -d "$staging_dir" ]]; then
+            log_verbose "🔐 Securely cleaning staging directory: $staging_dir"
+            
+            if command -v shred &>/dev/null; then
+                find "$staging_dir" -type f -exec shred -f -z -u {} \; 2>/dev/null || true
+            else
+                find "$staging_dir" -type f -exec dd if=/dev/zero of={} bs=1M count=1 2>/dev/null \; 2>/dev/null || true
+            fi
+            
+            rm -rf "$staging_dir" 2>/dev/null || true
+            log_verbose "✅ Staging directory cleaned"
+        fi
+    }
+    
+    trap 'cleanup_staging; cleanup_temp; exit' INT TERM EXIT
+    
+    echo "$staging_dir"
+}
+
+create_pre_restore_backup() {
+    local target_path="$1"
+    local backup_name="${2:-pre_restore}"
+    
+    if [[ ! -e "$target_path" ]]; then
+        log_verbose "⚠️ Target path does not exist: $target_path"
+        return 0
+    fi
+    
+    local timestamp=$(date +%Y%m%d_%H%M%S)
+    local pre_backup_dir="${BACKUP_BASE_DIR}/pre_restore_${backup_name}_${timestamp}"
+    
+    log "📦 Creating pre-restore backup to: $pre_backup_dir"
+    mkdir -p "$pre_backup_dir"
+    
+    if [[ -d "$target_path" ]]; then
+        cp -a "$target_path" "$pre_backup_dir/" 2>/dev/null || {
+            log "⚠️ Failed to backup target directory (may need sudo)"
+            return 1
+        }
+        log "✅ Pre-restore backup created: $(basename "$pre_backup_dir")"
+        echo "$pre_backup_dir"
+        return 0
+    elif [[ -f "$target_path" ]]; then
+        cp "$target_path" "$pre_backup_dir/" 2>/dev/null || {
+            log "⚠️ Failed to backup target file (may need sudo)"
+            return 1
+        }
+        log "✅ Pre-restore backup created: $(basename "$pre_backup_dir")"
+        echo "$pre_backup_dir"
+        return 0
+    else
+        log "⚠️ Target is not a file or directory: $target_path"
+        return 1
+    fi
+}
+
+confirm_restore() {
+    local target_path="$1"
+    local description="${2:-the target}"
+    
+    echo ""
+    echo "⚠️  WARNING: This will OVERWRITE: $target_path"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "📋 Description: $description"
+    echo ""
+    echo -n "Continue with restore? (type 'yes' to proceed): "
+    read -r confirm
+    
+    if [[ "$confirm" != "yes" ]]; then
+        echo "❌ Restore cancelled."
+        return 1
+    fi
+    
+    echo -n "FINAL CONFIRMATION: Are you sure? (YES/no): "
+    read -r final_confirm
+    if [[ "$final_confirm" != "YES" ]]; then
+        echo "❌ Restore cancelled."
+        return 1
+    fi
+    
+    return 0
 }
 
 encrypt_file() {
@@ -471,12 +807,12 @@ encrypt_file() {
         local openssl_opts=("-pbkdf2" "-iter" "${PBKDF2_ITERATIONS:-600000}")
         if [[ -n "$FIXED_NONCE" ]]; then
             openssl_opts+=("-S" "$FIXED_NONCE")
-            log_verbose "Using fixed nonce for deterministic encryption (deduplication enabled)"
+            log_verbose "Using fixed nonce for deterministic encryption"
         else
-            log_verbose "Using random nonce (deduplication disabled)"
+            log_verbose "Using random nonce"
         fi
 
-        log_verbose "Encrypting with ChaCha20-Poly1305 (PBKDF2 iterations: ${PBKDF2_ITERATIONS:-600000})"
+        log_verbose "Encrypting with ChaCha20-Poly1305 (PBKDF2: ${PBKDF2_ITERATIONS:-600000})"
         if openssl enc -chacha20 "${openssl_opts[@]}" \
             -in "$infile" -out "$outfile" \
             -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
@@ -495,10 +831,10 @@ encrypt_file() {
             local salt_hex
             salt_hex=$(tr -d '\n\r' < "$FIXED_SALT_FILE")
             openssl_opts+=("-S" "$salt_hex")
-            log_verbose "Using fixed salt for deterministic encryption (deduplication enabled)"
+            log_verbose "Using fixed salt for deterministic encryption"
         else
             openssl_opts+=("-salt")
-            log_verbose "Using random salt (deduplication disabled)"
+            log_verbose "Using random salt"
         fi
     else
         openssl_opts+=("-salt")
@@ -537,7 +873,7 @@ decrypt_file() {
         log_verbose "Trying ChaCha20 decryption..."
         if openssl enc -d -chacha20 -pbkdf2 -iter "${PBKDF2_ITERATIONS:-600000}" \
             -in "$infile" -out "$outfile" -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
-            log_verbose "✅ ChaCha20 decryption successful (integrity verified)"
+            log_verbose "✅ ChaCha20 decryption successful"
             return 0
         fi
 
@@ -555,11 +891,6 @@ decrypt_file() {
     log_verbose "Trying AES-CBC decryption (fallback)..."
     local file_header=$(head -c 16 "$infile" 2>/dev/null | od -An -tx1 | tr -d ' ')
     log_verbose "File header: $file_header"
-    if [[ "$file_header" == "53616c7465645f5f"* ]]; then
-        log_verbose "File has standard OpenSSL header (Salted__)"
-    else
-        log_verbose "File does NOT have standard OpenSSL header. Trying alternative methods..."
-    fi
 
     log_verbose "Trying decryption with pbkdf2 (iterations: ${PBKDF2_ITERATIONS:-600000})..."
     if openssl enc -d -aes-256-cbc -pbkdf2 -iter "${PBKDF2_ITERATIONS:-600000}" \
@@ -571,7 +902,7 @@ decrypt_file() {
     log_verbose "Trying decryption with pbkdf2 (iterations: 100000)..."
     if openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
         -in "$infile" -out "$outfile" -pass "file:$ENCRYPTION_KEY_FILE" 2>/dev/null; then
-        log_verbose "✅ Decryption successful (pbkdf2 method, 100000 iterations - legacy)"
+        log_verbose "✅ Decryption successful (pbkdf2 method, 100000 iterations)"
         return 0
     fi
 
@@ -674,6 +1005,62 @@ parse_backup_filename() {
     fi
 }
 
+get_backup_files_for_restore() {
+    local backup_dir="$1"
+    local -a files=()
+    
+    while IFS= read -r f; do
+        files+=("$f")
+    done < <(find "$backup_dir" -type f -name "*.enc" 2>/dev/null | sort)
+    
+    printf '%s\n' "${files[@]}"
+}
+
+find_backup_file() {
+    local search_term="$1"
+    local backup_dir="$2"
+    local -a matches=()
+    
+    if [[ -f "$search_term" ]]; then
+        echo "$search_term"
+        return 0
+    fi
+    
+    while IFS= read -r f; do
+        local basename=$(basename "$f")
+        local dirname=$(basename "$(dirname "$f")")
+        if [[ "$basename" == *"$search_term"* ]] || [[ "$dirname" == *"$search_term"* ]]; then
+            matches+=("$f")
+        fi
+    done < <(find "$backup_dir" -type f -name "*.enc" 2>/dev/null)
+    
+    if [[ ${#matches[@]} -eq 0 ]]; then
+        return 1
+    elif [[ ${#matches[@]} -eq 1 ]]; then
+        echo "${matches[0]}"
+        return 0
+    else
+        echo "Multiple backups found matching '$search_term':" >&2
+        local i=0
+        for f in "${matches[@]}"; do
+            i=$((i+1))
+            local basename=$(basename "$f")
+            local dirname=$(basename "$(dirname "$f")")
+            local size=$(human_size $(stat -c%s "$f" 2>/dev/null || echo 0))
+            printf "  %d) %s  (%s)  [%s]\n" "$i" "$basename" "$size" "$dirname" >&2
+        done
+        echo "" >&2
+        echo -n "Select number (1-$i): " >&2
+        read -r selection
+        if [[ "$selection" =~ ^[0-9]+$ ]] && [[ "$selection" -ge 1 ]] && [[ "$selection" -le ${#matches[@]} ]]; then
+            echo "${matches[$((selection-1))]}"
+            return 0
+        else
+            return 1
+        fi
+    fi
+}
+
 get_restore_file_list() {
     local selected_file="$1"
     local base timestamp type
@@ -767,22 +1154,71 @@ get_snapshot_file() {
     echo "${INCREMENTAL_BASE_DIR}/${snapshot_name}"
 }
 
+validate_snapshot() {
+    local snapshot_file="$1"
+    
+    if [[ ! -f "$snapshot_file" ]]; then
+        return 1
+    fi
+    
+    if ! grep -q "^last_backup:" "$snapshot_file" 2>/dev/null; then
+        log_verbose "⚠️ Snapshot missing 'last_backup' field"
+        return 1
+    fi
+    
+    if ! grep -q "^full:" "$snapshot_file" 2>/dev/null; then
+        log_verbose "⚠️ Snapshot missing 'full' field"
+        return 1
+    fi
+    
+    local checksum_line=$(grep "^checksum:" "$snapshot_file" 2>/dev/null)
+    if [[ -n "$checksum_line" ]]; then
+        local stored_checksum=$(echo "$checksum_line" | cut -d: -f2)
+        local content=$(grep -v "^checksum:" "$snapshot_file" 2>/dev/null)
+        local computed_checksum=$(echo "$content" | sha256sum | cut -d' ' -f1)
+        
+        if [[ "$stored_checksum" != "$computed_checksum" ]]; then
+            log_verbose "⚠️ Snapshot checksum mismatch (corrupted)"
+            return 1
+        fi
+    fi
+    
+    local last_backup=$(grep "^last_backup:" "$snapshot_file" | cut -d: -f2)
+    local current_time=$(date +%s)
+    if [[ -n "$last_backup" ]] && [[ "$last_backup" -gt "$((current_time + 3600))" ]]; then
+        log_verbose "⚠️ Snapshot has future timestamp (system clock issue?)"
+        return 1
+    fi
+    
+    return 0
+}
+
+update_snapshot_with_checksum() {
+    local snapshot_file="$1"
+    
+    local temp_file="${snapshot_file}.tmp"
+    
+    grep -v "^checksum:" "$snapshot_file" 2>/dev/null > "$temp_file" || true
+    
+    local content=$(cat "$temp_file")
+    local checksum=$(echo "$content" | sha256sum | cut -d' ' -f1)
+    echo "checksum:$checksum" >> "$temp_file"
+    
+    mv "$temp_file" "$snapshot_file"
+}
+
 get_last_full_backup() {
     local backup_type="$1"
     local snapshot_file=$(get_snapshot_file "$backup_type")
     
     if [[ -f "$snapshot_file" ]]; then
         local last_full=$(grep "^full:" "$snapshot_file" 2>/dev/null | tail -1 | cut -d: -f2)
-        
-        echo "DEBUG get_last_full_backup: $backup_type -> $last_full" >&2
-        
         if [[ -z "$last_full" ]]; then
             echo "0"
         else
             echo "$last_full"
         fi
     else
-        echo "DEBUG get_last_full_backup: $backup_type -> 0 (no file)" >&2
         echo "0"
     fi
 }
@@ -791,7 +1227,6 @@ should_do_full_backup() {
     local backup_type="$1"
     
     if [[ "$INCREMENTAL_ENABLED" != "true" ]]; then
-        echo "DEBUG should_do_full_backup: $backup_type -> FULL (incremental disabled)" >&2
         return 0
     fi
     
@@ -799,16 +1234,11 @@ should_do_full_backup() {
     local current_time=$(date +%s)
     local days_since=$(( (current_time - last_full) / 86400 ))
     
-    echo "DEBUG should_do_full_backup: $backup_type: last_full=$last_full, days_since=$days_since, threshold=$FULL_BACKUP_INTERVAL" >&2
-    
     if [[ $last_full -eq 0 ]]; then
-        echo "DEBUG should_do_full_backup: $backup_type -> FULL (no previous full)" >&2
         return 0
     elif [[ $days_since -ge $FULL_BACKUP_INTERVAL ]]; then
-        echo "DEBUG should_do_full_backup: $backup_type -> FULL (scheduled)" >&2
         return 0
     else
-        echo "DEBUG should_do_full_backup: $backup_type -> INCREMENTAL" >&2
         return 1
     fi
 }
@@ -825,24 +1255,14 @@ update_snapshot_full_time() {
     if [[ -f "$snapshot_file" ]]; then
         if grep -q "^full:" "$snapshot_file" 2>/dev/null; then
             sed -i "s/^full:.*/full:$current_time/" "$snapshot_file" 2>/dev/null || true
-            log_verbose "✅ Updated existing full: timestamp"
         else
             echo "full:$current_time" >> "$snapshot_file"
-            log_verbose "✅ Added full: timestamp to existing snapshot"
         fi
     else
         cat > "$snapshot_file" << EOF
 last_backup:$current_time
 full:$current_time
 EOF
-        log_verbose "✅ Created new snapshot with full: timestamp"
-    fi
-    
-    if grep -q "^full:" "$snapshot_file" 2>/dev/null; then
-        log_verbose "✅ Verified full: timestamp in snapshot"
-    else
-        log_verbose "⚠️ WARNING: Failed to add full: timestamp"
-        echo "full:$current_time" >> "$snapshot_file" 2>/dev/null || true
     fi
 }
 
@@ -850,14 +1270,15 @@ backup_directory_incremental() {
     local src="$1"
     local dest_dir="$2"
     local name="$3"
-    local archive_base="${dest_dir}/${name}"
+    local timestamp=$(get_timestamp)
+    local archive_base="${dest_dir}/${name}_${timestamp}"
     
     local backup_type="dir_${name}"
     local snapshot_file=$(get_snapshot_file "$backup_type")
     
     if [[ -f "$snapshot_file" ]]; then
-        if ! grep -q "^last_backup:" "$snapshot_file" 2>/dev/null; then
-            log "⚠️ Snapshot file $snapshot_file is corrupted. Removing it and forcing full backup."
+        if ! validate_snapshot "$snapshot_file"; then
+            log "⚠️ Snapshot corrupted. Forcing full backup."
             rm -f "$snapshot_file"
             rm -f "${INCREMENTAL_BASE_DIR}/${backup_type}_inc_*.snar" 2>/dev/null || true
             rm -f "${INCREMENTAL_BASE_DIR}/${backup_type}"*.snar 2>/dev/null || true
@@ -870,11 +1291,11 @@ backup_directory_incremental() {
     
     if [[ "$INCREMENTAL_ENABLED" != "true" ]]; then
         do_full=true
-        log "📦 Performing FULL backup of $src (incremental disabled)"
+        log "📦 FULL backup of $src (incremental disabled)"
     else
         if should_do_full_backup "$backup_type"; then
             do_full=true
-            log "📦 Performing FULL backup of $src (scheduled full backup)"
+            log "📦 FULL backup of $src (scheduled)"
         else
             if [[ -f "$snapshot_file" ]]; then
                 last_backup_time=$(grep "^last_backup:" "$snapshot_file" 2>/dev/null | cut -d: -f2)
@@ -882,15 +1303,15 @@ backup_directory_incremental() {
                 if [[ -n "$last_backup_time" ]] && [[ "$last_backup_time" -gt 0 ]]; then
                     do_full=false
                     local last_date=$(date -d "@$last_backup_time" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown")
-                    log "📦 Performing INCREMENTAL backup of $src (since $last_date)"
+                    log "📦 INCREMENTAL backup of $src (since $last_date)"
                 else
                     do_full=true
-                    log "⚠️ Invalid snapshot timestamp. Forcing FULL backup."
+                    log "⚠️ Invalid timestamp. Forcing FULL backup."
                     rm -f "$snapshot_file"
                 fi
             else
                 do_full=true
-                log "📦 Performing FULL backup of $src (no snapshot found)"
+                log "📦 FULL backup of $src (no snapshot)"
             fi
         fi
     fi
@@ -947,6 +1368,8 @@ backup_directory_incremental() {
             echo "full:$(date +%s)" >> "$snapshot_file"
         fi
         
+        update_snapshot_with_checksum "$snapshot_file"
+        
         log_verbose "Updated snapshot: $snapshot_file"
         
     else
@@ -1001,10 +1424,13 @@ backup_directory_incremental() {
                 echo "last_backup:$(date +%s)" > "$snapshot_file"
                 echo "full:$(date +%s)" >> "$snapshot_file"
             fi
+            
+            update_snapshot_with_checksum "$snapshot_file"
+            
             log_verbose "Updated snapshot: $snapshot_file"
             
         else
-            log "📊 No changes detected since last backup ($(date -d "@$last_backup_time" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown"))"
+            log "📊 No changes detected since last backup"
             
             touch "$tar_file"
             
@@ -1018,6 +1444,8 @@ backup_directory_incremental() {
                 echo "last_backup:$(date +%s)" > "$snapshot_file"
                 echo "full:$(date +%s)" >> "$snapshot_file"
             fi
+            
+            update_snapshot_with_checksum "$snapshot_file"
         fi
         
         rm -f "$changed_files" 2>/dev/null
@@ -1036,7 +1464,7 @@ backup_directory_incremental() {
 
     mv "$tar_file" "$final_tar_file"
 
-    log "🗜️ Compressing with gzip level $GZIP_LEVEL..."
+    log "🗜️ Compressing..."
     gzip -$GZIP_LEVEL "$final_tar_file" 2>/dev/null || error_exit "Compression failed for $final_tar_file"
     log "✅ Compression complete"
     
@@ -1046,7 +1474,7 @@ backup_directory_incremental() {
 
     generate_checksums "$final_gz_file" "${final_gz_file}.checksums"
     
-    log_verbose "Encrypting with ChaCha20..."
+    log_verbose "Encrypting..."
     encrypt_file "$final_gz_file" "$final_enc_file"
     
     if [[ -f "$final_enc_file" ]] && [[ -s "$final_enc_file" ]]; then
@@ -1055,13 +1483,13 @@ backup_directory_incremental() {
         rm -f "$final_gz_file"
         
         if [[ "$do_full" == "true" ]]; then
-            log "✅ FULL encrypted backup created: $(basename "$final_enc_file") ($(human_size $(stat -c%s "$final_enc_file" 2>/dev/null || echo 0)))"
+            log "✅ FULL backup: $(basename "$final_enc_file") ($(human_size $(stat -c%s "$final_enc_file" 2>/dev/null || echo 0)))"
         else
             local file_count=0
             if [[ -f "$final_tar_file" ]]; then
                 file_count=$(tar -tf "$final_tar_file" 2>/dev/null | wc -l || echo 0)
             fi
-            log "✅ INCREMENTAL encrypted backup created: $(basename "$final_enc_file") ($(human_size $(stat -c%s "$final_enc_file" 2>/dev/null || echo 0)))"
+            log "✅ INCREMENTAL backup: $(basename "$final_enc_file") ($(human_size $(stat -c%s "$final_enc_file" 2>/dev/null || echo 0)))"
             if [[ $file_count -gt 0 ]]; then
                 log "📊 Changed files: $file_count"
             fi
@@ -1071,17 +1499,19 @@ backup_directory_incremental() {
     fi
 }
 
-backup_docker_volume_incremental() {
-    local volume="$1"
-    local dest_dir="$2"
-    local archive_base="${dest_dir}/volume_${volume}"
+backup_container_volume() {
+    local runtime="$1"
+    local volume="$2"
+    local dest_dir="$3"
+    local timestamp=$(get_timestamp)
+    local archive_base="${dest_dir}/volume_${volume}_${timestamp}"
     
     local backup_type="vol_${volume}"
     local snapshot_file=$(get_snapshot_file "$backup_type")
     
     if [[ -f "$snapshot_file" ]]; then
-        if ! grep -q "^last_backup:" "$snapshot_file" 2>/dev/null; then
-            log "⚠️ Snapshot file $snapshot_file is corrupted. Removing and forcing full backup."
+        if ! validate_snapshot "$snapshot_file"; then
+            log "⚠️ Snapshot corrupted. Forcing full backup."
             rm -f "$snapshot_file"
             rm -f "${INCREMENTAL_BASE_DIR}/${backup_type}_inc_*.snar" 2>/dev/null || true
         fi
@@ -1093,26 +1523,26 @@ backup_docker_volume_incremental() {
     
     if [[ "$INCREMENTAL_ENABLED" != "true" ]]; then
         do_full=true
-        log "📦 Performing FULL backup of Docker volume: $volume (incremental disabled)"
+        log "📦 FULL backup of volume: $volume (incremental disabled)"
     else
         if should_do_full_backup "$backup_type"; then
             do_full=true
-            log "📦 Performing FULL backup of Docker volume: $volume (scheduled full backup)"
+            log "📦 FULL backup of volume: $volume (scheduled)"
         else
             if [[ -f "$snapshot_file" ]]; then
                 last_backup_time=$(grep "^last_backup:" "$snapshot_file" 2>/dev/null | cut -d: -f2)
                 if [[ -n "$last_backup_time" ]] && [[ "$last_backup_time" -gt 0 ]]; then
                     do_full=false
                     local last_date=$(date -d "@$last_backup_time" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown")
-                    log "📦 Performing INCREMENTAL backup of Docker volume: $volume (since $last_date)"
+                    log "📦 INCREMENTAL backup of volume: $volume (since $last_date)"
                 else
                     do_full=true
-                    log "⚠️ Invalid snapshot timestamp. Forcing FULL backup."
+                    log "⚠️ Invalid timestamp. Forcing FULL backup."
                     rm -f "$snapshot_file"
                 fi
             else
                 do_full=true
-                log "📦 Performing FULL backup of Docker volume: $volume (no snapshot found)"
+                log "📦 FULL backup of volume: $volume (no snapshot)"
             fi
         fi
     fi
@@ -1131,43 +1561,63 @@ backup_docker_volume_incremental() {
     local final_gz_file="${final_tar_file}.gz"
     local final_enc_file="${final_gz_file}.enc"
 
-    log "📦 Backing up Docker volume: $volume"
-    if ! docker volume inspect "$volume" &>/dev/null; then
-        error_exit "Docker volume $volume does not exist"
+    log "📦 Backing up volume: $volume"
+    if ! volume_exists "$runtime" "$volume"; then
+        error_exit "Volume $volume does not exist"
     fi
 
     local container_name="chantik_backup_vol_${volume}_$(date +%s)_$$"
-    log_verbose "Creating container: $container_name"
+    local snapshot_volume="${volume}_snapshot_$$"
     
-    local snapshot_volume="${volume}_snapshot"
+    create_snapshot_volume "$runtime" "$volume" "$snapshot_volume"
     
-    docker volume rm "$snapshot_volume" 2>/dev/null || true
-    docker volume create "$snapshot_volume" || error_exit "Failed to create snapshot volume"
+    trap "cleanup_snapshot_volume $runtime $snapshot_volume" EXIT
     
-    trap 'docker volume rm "$snapshot_volume" 2>/dev/null || true' EXIT
+    log_verbose "Copying volume data to snapshot..."
     
-    docker run --rm \
-        -v "$volume":/source:ro \
-        -v "$snapshot_volume":/target \
-        "$DOCKER_IMAGE" \
-        cp -a /source/. /target/ 2>/dev/null || true
+    if [[ "$runtime" == "podman" ]]; then
+        local copy_container="chantik_copy_$$"
+        podman run -d --name "$copy_container" -v "$volume":/source:ro -v "$snapshot_volume":/target "$DOCKER_IMAGE" sleep infinity 2>/dev/null || \
+            podman run -d --name "$copy_container" -v "$volume":/source:ro -v "$snapshot_volume":/target alpine sleep infinity 2>/dev/null
+        podman exec "$copy_container" sh -c "cp -a /source/. /target/ 2>/dev/null || true" 2>/dev/null
+        podman rm -f "$copy_container" 2>/dev/null || true
+    else
+        docker run --rm -v "$volume":/source:ro -v "$snapshot_volume":/target "$DOCKER_IMAGE" \
+            sh -c "cp -a /source/. /target/ 2>/dev/null || true" 2>/dev/null || true
+    fi
     
     if [[ "$do_full" == "true" ]]; then
         log "Creating FULL backup archive for volume..."
         
-        docker run --rm --name "$container_name" \
-            -v "$snapshot_volume":/volume \
-            -v "$dest_dir":/backup \
-            "$DOCKER_IMAGE" \
-            sh -c "tar -cf '/backup/${volume}.tar' -C /volume . \
-                --preserve-permissions --same-owner 2>/dev/null" || \
+        if [[ "$runtime" == "podman" ]]; then
+            podman run --rm --name "$container_name" \
+                -v "$snapshot_volume":/volume \
+                -v "$dest_dir":/backup \
+                "$DOCKER_IMAGE" \
+                sh -c "tar -cf '/backup/${volume}_${timestamp}.tar' -C /volume . \
+                    --preserve-permissions --same-owner 2>/dev/null" || \
+            podman run --rm --name "$container_name" \
+                -v "$snapshot_volume":/volume \
+                -v "$dest_dir":/backup \
+                alpine \
+                tar -cf "/backup/${volume}_${timestamp}.tar" -C /volume . 2>/dev/null || {
+                    error_exit "Failed to create tar for volume $volume"
+                }
+        else
+            docker run --rm --name "$container_name" \
+                -v "$snapshot_volume":/volume \
+                -v "$dest_dir":/backup \
+                "$DOCKER_IMAGE" \
+                sh -c "tar -cf '/backup/${volume}_${timestamp}.tar' -C /volume . \
+                    --preserve-permissions --same-owner 2>/dev/null" || \
             docker run --rm --name "$container_name" \
                 -v "$snapshot_volume":/volume \
                 -v "$dest_dir":/backup \
                 alpine \
-                tar -cf "/backup/${volume}.tar" -C /volume . 2>/dev/null || {
+                tar -cf "/backup/${volume}_${timestamp}.tar" -C /volume . 2>/dev/null || {
                     error_exit "Failed to create tar for volume $volume"
                 }
+        fi
         
         update_snapshot_full_time "$backup_type"
         
@@ -1182,6 +1632,8 @@ backup_docker_volume_incremental() {
             echo "full:$(date +%s)" >> "$snapshot_file"
         fi
         
+        update_snapshot_with_checksum "$snapshot_file"
+        
         log_verbose "Updated snapshot: $snapshot_file"
         
     else
@@ -1191,34 +1643,65 @@ backup_docker_volume_incremental() {
         touch -d "@$last_backup_time" "$timestamp_file" 2>/dev/null || \
             touch -t "$(date -d "@$last_backup_time" '+%Y%m%d%H%M.%S' 2>/dev/null || echo '197001010000.00')" "$timestamp_file" 2>/dev/null
         
-        docker run --rm --name "$container_name" \
-            -v "$snapshot_volume":/volume \
-            -v "$dest_dir":/backup \
-            -v "$(dirname "$timestamp_file")":/timestamps \
-            "$DOCKER_IMAGE" \
-            sh -c "
-                TIMESTAMP_FILE='/timestamps/$(basename "$timestamp_file")'
-                if [ -f \"\$TIMESTAMP_FILE\" ]; then
-                    find /volume -type f -newer \"\$TIMESTAMP_FILE\" > /tmp/changed.txt 2>/dev/null
-                    if [ -s /tmp/changed.txt ]; then
-                        tar -cf '/backup/${volume}.tar' -C /volume --files-from=/tmp/changed.txt --preserve-permissions 2>/dev/null
+        if [[ "$runtime" == "podman" ]]; then
+            podman run --rm --name "$container_name" \
+                -v "$snapshot_volume":/volume \
+                -v "$dest_dir":/backup \
+                -v "$(dirname "$timestamp_file")":/timestamps \
+                "$DOCKER_IMAGE" \
+                sh -c "
+                    TIMESTAMP_FILE='/timestamps/$(basename "$timestamp_file")'
+                    if [ -f \"\$TIMESTAMP_FILE\" ]; then
+                        find /volume -type f -newer \"\$TIMESTAMP_FILE\" > /tmp/changed.txt 2>/dev/null
+                        if [ -s /tmp/changed.txt ]; then
+                            tar -cf '/backup/${volume}_${timestamp}.tar' -C /volume --files-from=/tmp/changed.txt --preserve-permissions 2>/dev/null
+                        else
+                            touch '/backup/${volume}_${timestamp}.tar'
+                        fi
                     else
-                        touch '/backup/${volume}.tar'
+                        tar -cf '/backup/${volume}_${timestamp}.tar' -C /volume . --preserve-permissions 2>/dev/null
                     fi
-                else
-                    tar -cf '/backup/${volume}.tar' -C /volume . --preserve-permissions 2>/dev/null
-                fi
-            " || {
-                log_verbose "Incremental backup failed, creating full backup"
-                docker run --rm --name "${container_name}_full" \
-                    -v "$snapshot_volume":/volume \
-                    -v "$dest_dir":/backup \
-                    alpine \
-                    tar -cf "/backup/${volume}.tar" -C /volume . 2>/dev/null || {
-                        error_exit "Failed to create tar for volume $volume"
-                    }
-                do_full=true
-            }
+                " || {
+                    log_verbose "Incremental backup failed, creating full backup"
+                    do_full=true
+                    podman run --rm --name "${container_name}_full" \
+                        -v "$snapshot_volume":/volume \
+                        -v "$dest_dir":/backup \
+                        alpine \
+                        tar -cf "/backup/${volume}_${timestamp}.tar" -C /volume . 2>/dev/null || {
+                            error_exit "Failed to create tar for volume $volume"
+                        }
+                }
+        else
+            docker run --rm --name "$container_name" \
+                -v "$snapshot_volume":/volume \
+                -v "$dest_dir":/backup \
+                -v "$(dirname "$timestamp_file")":/timestamps \
+                "$DOCKER_IMAGE" \
+                sh -c "
+                    TIMESTAMP_FILE='/timestamps/$(basename "$timestamp_file")'
+                    if [ -f \"\$TIMESTAMP_FILE\" ]; then
+                        find /volume -type f -newer \"\$TIMESTAMP_FILE\" > /tmp/changed.txt 2>/dev/null
+                        if [ -s /tmp/changed.txt ]; then
+                            tar -cf '/backup/${volume}_${timestamp}.tar' -C /volume --files-from=/tmp/changed.txt --preserve-permissions 2>/dev/null
+                        else
+                            touch '/backup/${volume}_${timestamp}.tar'
+                        fi
+                    else
+                        tar -cf '/backup/${volume}_${timestamp}.tar' -C /volume . --preserve-permissions 2>/dev/null
+                    fi
+                " || {
+                    log_verbose "Incremental backup failed, creating full backup"
+                    do_full=true
+                    docker run --rm --name "${container_name}_full" \
+                        -v "$snapshot_volume":/volume \
+                        -v "$dest_dir":/backup \
+                        alpine \
+                        tar -cf "/backup/${volume}_${timestamp}.tar" -C /volume . 2>/dev/null || {
+                            error_exit "Failed to create tar for volume $volume"
+                        }
+                }
+        fi
         
         rm -f "$timestamp_file" 2>/dev/null
         
@@ -1232,24 +1715,28 @@ backup_docker_volume_incremental() {
             echo "last_backup:$(date +%s)" > "$snapshot_file"
             echo "full:$(date +%s)" >> "$snapshot_file"
         fi
+        
+        update_snapshot_with_checksum "$snapshot_file"
+        
         log_verbose "Updated snapshot: $snapshot_file"
     fi
     
-    docker volume rm "$snapshot_volume" 2>/dev/null || true
+    cleanup_snapshot_volume "$runtime" "$snapshot_volume"
     trap - EXIT
 
-    if [[ ! -f "${dest_dir}/${volume}.tar" ]]; then
+    local temp_tar="${dest_dir}/${volume}_${timestamp}.tar"
+    if [[ ! -f "$temp_tar" ]]; then
         error_exit "Tar file not created for volume $volume"
     fi
 
-    if [[ ! -s "${dest_dir}/${volume}.tar" ]] && [[ "$do_full" == "false" ]]; then
+    if [[ ! -s "$temp_tar" ]] && [[ "$do_full" == "false" ]]; then
         log "📦 Empty incremental backup (no changes in volume)"
-        rm -f "${dest_dir}/${volume}.tar" 2>/dev/null
+        rm -f "$temp_tar" 2>/dev/null
         log "✅ No changes to backup for volume $volume"
         return 0
     fi
 
-    mv "${dest_dir}/${volume}.tar" "$final_tar_file"
+    mv "$temp_tar" "$final_tar_file"
     
     if ! tar -tf "$final_tar_file" &>/dev/null; then
         error_exit "Tar file is corrupted or empty: $final_tar_file"
@@ -1260,7 +1747,7 @@ backup_docker_volume_incremental() {
         touch "$snapshot_file"
     fi
 
-    log "🗜️ Compressing with gzip level $GZIP_LEVEL..."
+    log "🗜️ Compressing..."
     gzip -$GZIP_LEVEL "$final_tar_file" 2>/dev/null || error_exit "Compression failed for $final_tar_file"
     if [[ ! -f "$final_gz_file" ]] || [[ ! -s "$final_gz_file" ]]; then
         error_exit "Compression failed for $final_tar_file"
@@ -1268,7 +1755,7 @@ backup_docker_volume_incremental() {
 
     generate_checksums "$final_gz_file" "${final_gz_file}.checksums"
     
-    log_verbose "Encrypting volume backup with ChaCha20..."
+    log_verbose "Encrypting volume backup..."
     encrypt_file "$final_gz_file" "$final_enc_file"
     
     if [[ -f "$final_enc_file" ]] && [[ -s "$final_enc_file" ]]; then
@@ -1278,19 +1765,580 @@ backup_docker_volume_incremental() {
         rm -f "$final_gz_file"
         
         if [[ "$do_full" == "true" ]]; then
-            log "✅ FULL encrypted volume backup created: $(basename "$final_enc_file") ($(human_size $(stat -c%s "$final_enc_file" 2>/dev/null || echo 0)))"
+            log "✅ FULL volume backup: $(basename "$final_enc_file") ($(human_size $(stat -c%s "$final_enc_file" 2>/dev/null || echo 0)))"
         else
             local file_count=0
             if [[ -f "$final_tar_file" ]]; then
                 file_count=$(tar -tf "$final_tar_file" 2>/dev/null | wc -l || echo 0)
             fi
-            log "✅ INCREMENTAL encrypted volume backup created: $(basename "$final_enc_file") ($(human_size $(stat -c%s "$final_enc_file" 2>/dev/null || echo 0)))"
+            log "✅ INCREMENTAL volume backup: $(basename "$final_enc_file") ($(human_size $(stat -c%s "$final_enc_file" 2>/dev/null || echo 0)))"
             if [[ $file_count -gt 0 ]]; then
                 log "📊 Changed files in volume: $file_count"
             fi
         fi
     else
         error_exit "Encryption failed for $final_gz_file"
+    fi
+}
+
+cleanup_snapshot_volume() {
+    local runtime="$1"
+    local snapshot_volume="$2"
+    
+    if [[ "$runtime" == "podman" ]]; then
+        podman volume rm "$snapshot_volume" 2>/dev/null || true
+    else
+        docker volume rm "$snapshot_volume" 2>/dev/null || true
+    fi
+}
+
+restore_single_backup() {
+    local enc_file="$1"
+    local staging_dir="$2"
+    
+    if [[ ! -f "$enc_file" ]]; then
+        echo "ERROR: Backup file not found: $enc_file" >&2
+        return 1
+    fi
+
+    local restore_files
+    mapfile -t restore_files < <(get_restore_file_list "$enc_file") || {
+        echo "ERROR: Failed to determine restore files" >&2
+        return 1
+    }
+
+    if [[ ${#restore_files[@]} -eq 0 ]]; then
+        echo "ERROR: No files to restore" >&2
+        return 1
+    fi
+
+    local first_file="${restore_files[0]}"
+    local base_name timestamp type
+    parse_backup_filename "$first_file"
+    local base="$BASE"
+    
+    local target_path=""
+    local restore_type=""
+    local volume_name=""
+    
+    if [[ "$base" == "digital-independence" ]] || [[ "$base" == "$(basename "$SOURCE_DIR")" ]]; then
+        restore_type="dir"
+        target_path="${SOURCE_DIR%/}"
+    elif [[ "$base" =~ ^volume_ ]]; then
+        restore_type="volume"
+        volume_name="${base#volume_}"
+        target_path="Volume: $volume_name"
+    else
+        restore_type="dir"
+        target_path="${SOURCE_DIR%/}"
+    fi
+
+    local pre_backup_path=""
+    if [[ -e "$target_path" ]] || [[ -n "$volume_name" ]]; then
+        echo ""
+        echo "🔄 Creating pre-restore backup..."
+        if [[ "$restore_type" == "volume" ]]; then
+            local runtime=$(detect_container_runtime)
+            if volume_exists "$runtime" "$volume_name"; then
+                local snapshot_vol="${volume_name}_pre_restore_$$"
+                create_snapshot_volume "$runtime" "$volume_name" "$snapshot_vol"
+                pre_backup_path="Volume snapshot: $snapshot_vol"
+                log "✅ Pre-restore volume snapshot created: $snapshot_vol"
+            else
+                log_verbose "⚠️ Volume $volume_name does not exist, no pre-restore backup needed"
+            fi
+        else
+            pre_backup_path=$(create_pre_restore_backup "$target_path" "$base")
+            if [[ $? -ne 0 ]]; then
+                echo "⚠️ Failed to create pre-restore backup. Continue anyway? (yes/no): "
+                read -r continue_anyway
+                if [[ "$continue_anyway" != "yes" ]]; then
+                    return 1
+                fi
+            fi
+        fi
+    fi
+
+    if [[ -n "$pre_backup_path" ]]; then
+        echo ""
+        echo "💾 Pre-restore backup saved to: $pre_backup_path"
+    fi
+    
+    if ! confirm_restore "$target_path" "Restoring from: $(basename "$enc_file")"; then
+        return 1
+    fi
+
+    log "🔄 Restoring from ${#restore_files[@]} backup(s)"
+
+    local checksum_ok=true
+    local checksum_failed=0
+
+    for enc in "${restore_files[@]}"; do
+        log "📦 Processing: $(basename "$enc")"
+        local decrypted_gz="${staging_dir}/$(basename "${enc%.enc}")"
+        log "🔐 Decrypting..."
+        decrypt_file "$enc" "$decrypted_gz" || {
+            echo "ERROR: Decryption failed for $enc" >&2
+            return 1
+        }
+
+        local checksum_file="${enc%.enc}.checksums"
+        if [[ -f "$checksum_file" ]]; then
+            local stored_sha=$(grep '^SHA256:' "$checksum_file" | awk '{print $2}')
+            local current_sha=$(sha256sum "$decrypted_gz" | awk '{print $1}')
+            if [[ "$stored_sha" != "$current_sha" ]]; then
+                log "❌ Checksum MISMATCH for $(basename "$enc")"
+                checksum_ok=false
+                checksum_failed=$((checksum_failed + 1))
+            else
+                log "✅ Checksum verified: $(basename "$enc")"
+            fi
+        else
+            log "⚠️ No checksum file found for $(basename "$enc")"
+        fi
+
+        log "🗜️ Decompressing..."
+        gunzip -f "$decrypted_gz" || {
+            echo "ERROR: Gunzip failed" >&2
+            return 1
+        }
+        local tar_file="${decrypted_gz%.gz}"
+        if [[ ! -f "$tar_file" ]]; then
+            echo "ERROR: Tar file not found after decompression" >&2
+            return 1
+        fi
+
+        log "📂 Extracting to staging..."
+        tar -xf "$tar_file" -C "$staging_dir" --overwrite --preserve-permissions 2>/dev/null || \
+            tar -xf "$tar_file" -C "$staging_dir" --overwrite 2>/dev/null || {
+                echo "ERROR: Failed to extract tar" >&2
+                return 1
+            }
+
+        rm -f "$tar_file" "$decrypted_gz" 2>/dev/null
+    done
+
+    log "✅ All backups extracted to staging: $staging_dir"
+
+    if [[ "$restore_type" == "dir" ]]; then
+        mkdir -p "$target_path" 2>/dev/null || sudo mkdir -p "$target_path" 2>/dev/null
+        
+        log "📁 Restoring directory to $target_path"
+        
+        if command -v rsync &>/dev/null; then
+            rsync -a --no-owner --no-group "$staging_dir/" "$target_path/" 2>/dev/null
+        else
+            cp -a "$staging_dir/." "$target_path/" 2>/dev/null
+        fi
+        
+        log "✅ Directory restore completed to $target_path"
+
+    elif [[ "$restore_type" == "volume" ]]; then
+        log "📦 Restoring volume: $volume_name"
+        
+        local runtime=$(detect_container_runtime)
+        
+        if ! volume_exists "$runtime" "$volume_name"; then
+            if [[ "$runtime" == "podman" ]]; then
+                podman volume create "$volume_name" || {
+                    echo "ERROR: Failed to create volume $volume_name" >&2
+                    return 1
+                }
+            else
+                docker volume create "$volume_name" || {
+                    echo "ERROR: Failed to create volume $volume_name" >&2
+                    return 1
+                }
+            fi
+            log "📦 Created volume: $volume_name"
+        fi
+
+        local container_name="chantik_restore_vol_${volume_name}_$(date +%s)_$$"
+        
+        if [[ "$runtime" == "podman" ]]; then
+            podman run -d --name "$container_name" -v "$volume_name":/volume "$DOCKER_IMAGE" sleep infinity 2>/dev/null || \
+                podman run -d --name "$container_name" -v "$volume_name":/volume alpine sleep infinity 2>/dev/null || {
+                    echo "ERROR: Cannot create restore container" >&2
+                    return 1
+                }
+            
+            podman cp "$staging_dir/." "$container_name:/volume/" 2>/dev/null || \
+                podman cp "$staging_dir" "$container_name:/volume/" 2>/dev/null || {
+                    echo "ERROR: Failed to copy data to volume" >&2
+                    return 1
+                }
+            
+            local source_count=$(find "$staging_dir" -type f 2>/dev/null | wc -l)
+            local dest_count=$(podman exec "$container_name" find /volume -type f 2>/dev/null | wc -l)
+            
+            if [[ "$source_count" -ne "$dest_count" ]]; then
+                log "❌ File count mismatch during volume restore"
+                log "   Source: $source_count files"
+                log "   Destination: $dest_count files"
+                return 1
+            fi
+            
+            log "✅ Volume restore verified: $source_count files copied"
+            
+            podman stop "$container_name" >/dev/null 2>&1
+            podman rm "$container_name" >/dev/null 2>&1
+        else
+            docker run -d --name "$container_name" -v "$volume_name":/volume "$DOCKER_IMAGE" sleep infinity 2>/dev/null || \
+                docker run -d --name "$container_name" -v "$volume_name":/volume alpine sleep infinity 2>/dev/null || {
+                    echo "ERROR: Cannot create restore container" >&2
+                    return 1
+                }
+            
+            docker cp "$staging_dir/." "$container_name:/volume/" 2>/dev/null || \
+                docker cp "$staging_dir" "$container_name:/volume/" 2>/dev/null || {
+                    echo "ERROR: Failed to copy data to volume" >&2
+                    return 1
+                }
+            
+            local source_count=$(find "$staging_dir" -type f 2>/dev/null | wc -l)
+            local dest_count=$(docker exec "$container_name" find /volume -type f 2>/dev/null | wc -l)
+            
+            if [[ "$source_count" -ne "$dest_count" ]]; then
+                log "❌ File count mismatch during volume restore"
+                log "   Source: $source_count files"
+                log "   Destination: $dest_count files"
+                return 1
+            fi
+            
+            log "✅ Volume restore verified: $source_count files copied"
+            
+            docker stop "$container_name" >/dev/null 2>&1
+            docker rm "$container_name" >/dev/null 2>&1
+        fi
+        
+        log "✅ Volume restore completed for $volume_name"
+    else
+        echo "ERROR: Unknown restore type" >&2
+        return 1
+    fi
+
+    return 0
+}
+
+multi_restore_from_backup() {
+    local -a backup_patterns=("$@")
+    
+    if [[ ${#backup_patterns[@]} -eq 0 ]]; then
+        echo "🕊️ ERROR: No backup patterns specified for multi-restore."
+        echo ""
+        echo "Usage: $SCRIPT_NAME restore <pattern1> <pattern2> ..."
+        echo ""
+        echo "Examples:"
+        echo "  $SCRIPT_NAME restore volume_postgres volume_redis"
+        echo "  $SCRIPT_NAME restore 20260906 20260907"
+        echo "  $SCRIPT_NAME restore postgres redis"
+        echo ""
+        echo "Available backups:"
+        chantik_list_backups "$BACKUP_BASE_DIR"
+        return 1
+    fi
+    
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "🔄 MULTI-RESTORE: ${#backup_patterns[@]} pattern(s)"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    
+    echo ""
+    echo "📦 Phase 1: Staging all restores..."
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    
+    local -a staged_restores=()
+    local -a failed_patterns=()
+    local -a stage_dirs=()
+    
+    for pattern in "${backup_patterns[@]}"; do
+        echo ""
+        echo "🔍 Staging: '$pattern'"
+        
+        local enc_file
+        if ! enc_file=$(find_backup_file "$pattern" "$BACKUP_BASE_DIR"); then
+            echo "  ❌ No backup found matching '$pattern'"
+            failed_patterns+=("$pattern")
+            continue
+        fi
+        
+        local pattern_stage=$(setup_secure_staging "stage_${pattern}_$$")
+        stage_dirs+=("$pattern_stage")
+        
+        if restore_single_backup "$enc_file" "$pattern_stage"; then
+            staged_restores+=("$pattern|$pattern_stage|$enc_file")
+            echo "  ✅ Staged successfully: $pattern"
+        else
+            failed_patterns+=("$pattern")
+            echo "  ❌ Failed to stage: $pattern"
+        fi
+    done
+    
+    if [[ ${#failed_patterns[@]} -gt 0 ]]; then
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "❌ MULTI-RESTORE TRANSACTION FAILED"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "⚠️  Failed patterns: ${failed_patterns[*]}"
+        echo "📦 Successful stages: ${#staged_restores[@]}"
+        echo ""
+        echo "🧹 Cleaning up staged restores (NO CHANGES APPLIED)..."
+        
+        for stage_dir in "${stage_dirs[@]}"; do
+            rm -rf "$stage_dir" 2>/dev/null || true
+        done
+        
+        echo "✅ Cleanup complete. No changes were applied to your system."
+        return 1
+    fi
+    
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "✅ Phase 2: All ${#staged_restores[@]} restores staged successfully"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    
+    echo "📋 Restore plan:"
+    for staged in "${staged_restores[@]}"; do
+        IFS='|' read -r pattern stage_dir enc_file <<< "$staged"
+        echo "  - $pattern -> $(basename "$enc_file")"
+    done
+    
+    echo ""
+    echo -n "Apply all restores? (type 'APPLY' to proceed): "
+    read -r apply_confirm
+    
+    if [[ "$apply_confirm" != "APPLY" ]]; then
+        echo "❌ Multi-restore cancelled. No changes applied."
+        
+        for stage_dir in "${stage_dirs[@]}"; do
+            rm -rf "$stage_dir" 2>/dev/null || true
+        done
+        return 0
+    fi
+    
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "🔄 Phase 3: Applying restores..."
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    
+    local -a applied=()
+    local -a apply_failed=()
+    
+    for staged in "${staged_restores[@]}"; do
+        IFS='|' read -r pattern stage_dir enc_file <<< "$staged"
+        
+        echo ""
+        echo "📦 Applying: $pattern"
+        
+        local first_file="$enc_file"
+        local base_name timestamp type
+        parse_backup_filename "$first_file"
+        local base="$BASE"
+        
+        if [[ "$base" == "digital-independence" ]] || [[ "$base" == "$(basename "$SOURCE_DIR")" ]]; then
+            local dest_dir="${SOURCE_DIR%/}"
+            log "📁 Applying to: $dest_dir"
+            
+            if command -v rsync &>/dev/null; then
+                rsync -a --no-owner --no-group "$stage_dir/" "$dest_dir/" 2>/dev/null
+            else
+                cp -a "$stage_dir/." "$dest_dir/" 2>/dev/null
+            fi
+            
+            if [[ $? -eq 0 ]]; then
+                applied+=("$pattern")
+                echo "  ✅ Applied: $pattern"
+            else
+                apply_failed+=("$pattern")
+                echo "  ❌ Failed to apply: $pattern"
+            fi
+            
+        elif [[ "$base" =~ ^volume_ ]]; then
+            local volume_name="${base#volume_}"
+            log "📦 Applying to volume: $volume_name"
+            
+            local runtime=$(detect_container_runtime)
+            
+            if ! volume_exists "$runtime" "$volume_name"; then
+                if [[ "$runtime" == "podman" ]]; then
+                    podman volume create "$volume_name" || {
+                        apply_failed+=("$pattern")
+                        continue
+                    }
+                else
+                    docker volume create "$volume_name" || {
+                        apply_failed+=("$pattern")
+                        continue
+                    }
+                fi
+                log "📦 Created volume: $volume_name"
+            fi
+            
+            local container_name="chantik_apply_vol_${volume_name}_$(date +%s)_$$"
+            
+            if [[ "$runtime" == "podman" ]]; then
+                podman run -d --name "$container_name" -v "$volume_name":/volume "$DOCKER_IMAGE" sleep infinity 2>/dev/null || \
+                podman run -d --name "$container_name" -v "$volume_name":/volume alpine sleep infinity 2>/dev/null || {
+                    apply_failed+=("$pattern")
+                    continue
+                }
+                
+                podman cp "$stage_dir/." "$container_name:/volume/" 2>/dev/null
+                local copy_result=$?
+                
+                if [[ $copy_result -eq 0 ]]; then
+                    local source_count=$(find "$stage_dir" -type f 2>/dev/null | wc -l)
+                    local dest_count=$(podman exec "$container_name" find /volume -type f 2>/dev/null | wc -l)
+                    if [[ "$source_count" -eq "$dest_count" ]]; then
+                        applied+=("$pattern")
+                        echo "  ✅ Applied: $pattern ($source_count files)"
+                    else
+                        apply_failed+=("$pattern")
+                        echo "  ❌ Failed to apply: $pattern (file count mismatch)"
+                    fi
+                else
+                    apply_failed+=("$pattern")
+                    echo "  ❌ Failed to apply: $pattern"
+                fi
+                
+                podman stop "$container_name" >/dev/null 2>&1
+                podman rm "$container_name" >/dev/null 2>&1
+                
+            else
+                docker run -d --name "$container_name" -v "$volume_name":/volume "$DOCKER_IMAGE" sleep infinity 2>/dev/null || \
+                docker run -d --name "$container_name" -v "$volume_name":/volume alpine sleep infinity 2>/dev/null || {
+                    apply_failed+=("$pattern")
+                    continue
+                }
+                
+                docker cp "$stage_dir/." "$container_name:/volume/" 2>/dev/null
+                local copy_result=$?
+                
+                if [[ $copy_result -eq 0 ]]; then
+                    local source_count=$(find "$stage_dir" -type f 2>/dev/null | wc -l)
+                    local dest_count=$(docker exec "$container_name" find /volume -type f 2>/dev/null | wc -l)
+                    if [[ "$source_count" -eq "$dest_count" ]]; then
+                        applied+=("$pattern")
+                        echo "  ✅ Applied: $pattern ($source_count files)"
+                    else
+                        apply_failed+=("$pattern")
+                        echo "  ❌ Failed to apply: $pattern (file count mismatch)"
+                    fi
+                else
+                    apply_failed+=("$pattern")
+                    echo "  ❌ Failed to apply: $pattern"
+                fi
+                
+                docker stop "$container_name" >/dev/null 2>&1
+                docker rm "$container_name" >/dev/null 2>&1
+            fi
+        fi
+        
+        rm -rf "$stage_dir" 2>/dev/null || true
+    done
+    
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "📊 MULTI-RESTORE TRANSACTION COMPLETE"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "✅ Successfully applied: ${#applied[@]}"
+    echo "❌ Failed to apply: ${#apply_failed[@]}"
+    
+    if [[ ${#apply_failed[@]} -gt 0 ]]; then
+        echo "⚠️  Failed items: ${apply_failed[*]}"
+        echo ""
+        echo "💡 Some restores failed. Your system may be in an inconsistent state."
+        echo "   Check the logs for details: $LOG_FILE"
+        return 1
+    else
+        echo "✅ All restores applied successfully!"
+        return 0
+    fi
+}
+
+restore_from_backup() {
+    local input="$1"
+    
+    local dry_run=false
+    if [[ "$1" == "--dry-run" ]]; then
+        dry_run=true
+        shift
+        input="$1"
+    fi
+    
+    if [[ $# -gt 1 ]]; then
+        multi_restore_from_backup "$@"
+        return $?
+    fi
+    
+    if [[ "$input" == *" "* ]] || [[ "$input" == *","* ]]; then
+        IFS=' ,' read -ra patterns <<< "$input"
+        multi_restore_from_backup "${patterns[@]}"
+        return $?
+    fi
+    
+    local enc_file
+    if ! enc_file=$(find_backup_file "$input" "$BACKUP_BASE_DIR"); then
+        echo "🕊️ ERROR: No backup found matching '$input'"
+        echo ""
+        echo "Available backups:"
+        chantik_list_backups "$BACKUP_BASE_DIR"
+        exit 1
+    fi
+    
+    if [[ "$dry_run" == "true" ]]; then
+        echo ""
+        echo "🔍 DRY RUN MODE - No changes will be made"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "📦 Would restore: $(basename "$enc_file")"
+        
+        local restore_files
+        mapfile -t restore_files < <(get_restore_file_list "$enc_file") || {
+            echo "ERROR: Failed to determine restore files" >&2
+            return 1
+        }
+        echo "📁 Total backups to restore: ${#restore_files[@]}"
+        
+        local total_size=0
+        for f in "${restore_files[@]}"; do
+            local size=$(stat -c%s "$f" 2>/dev/null || echo 0)
+            total_size=$((total_size + size))
+            echo "   - $(basename "$f") ($(human_size "$size"))"
+        done
+        echo "📊 Total size: $(human_size "$total_size")"
+        
+        local first_file="${restore_files[0]}"
+        local base_name timestamp type
+        parse_backup_filename "$first_file"
+        local base="$BASE"
+        
+        if [[ "$base" == "digital-independence" ]] || [[ "$base" == "$(basename "$SOURCE_DIR")" ]]; then
+            echo "📂 Target: ${SOURCE_DIR%/}"
+        elif [[ "$base" =~ ^volume_ ]]; then
+            local volume_name="${base#volume_}"
+            echo "📦 Target volume: $volume_name"
+        else
+            echo "📂 Target: ${SOURCE_DIR%/}"
+        fi
+        
+        echo ""
+        echo "✅ Dry run complete. No changes made."
+        return 0
+    fi
+    
+    local staging_dir=$(setup_secure_staging "restore_$$")
+    trap 'rm -rf "$staging_dir" 2>/dev/null; cleanup_temp; exit' INT TERM EXIT
+    
+    if restore_single_backup "$enc_file" "$staging_dir"; then
+        rm -rf "$staging_dir" 2>/dev/null
+        trap - INT TERM EXIT
+        log "✅ Restore completed successfully."
+        return 0
+    else
+        rm -rf "$staging_dir" 2>/dev/null
+        trap - INT TERM EXIT
+        error_exit "Restore failed"
     fi
 }
 
@@ -1322,8 +2370,6 @@ verify_backup() {
         
         if [[ "$stored_sha" != "$current_sha" ]]; then
             log "❌ SHA256 MISMATCH for $(basename "$enc_file")"
-            log "   Stored:  $stored_sha"
-            log "   Current: $current_sha"
             return 1
         fi
         log "✅ SHA256 verified for $(basename "$enc_file")"
@@ -1377,126 +2423,6 @@ verify_backup() {
         rm -rf "$tmp_dir" 2>/dev/null
         return 1
     fi
-}
-
-get_backup_age_days() {
-    local filepath="$1"
-    local filename=$(basename "$filepath")
-    local date_str=$(echo "$filename" | grep -oE '[0-9]{8}_[0-9]{6}' | head -1)
-    if [[ -z "$date_str" ]]; then
-        local mtime=$(stat -c %Y "$filepath" 2>/dev/null || stat -f %m "$filepath" 2>/dev/null)
-        if [[ -n "$mtime" ]]; then
-            local now=$(date +%s)
-            echo $(( (now - mtime) / 86400 ))
-        else
-            echo 9999
-        fi
-    else
-        local file_epoch=$(date -d "${date_str:0:8} ${date_str:9:2}:${date_str:11:2}:${date_str:13:2}" +%s 2>/dev/null || echo 0)
-        if [[ $file_epoch -eq 0 ]]; then
-            echo 9999
-        else
-            local now=$(date +%s)
-            echo $(( (now - file_epoch) / 86400 ))
-        fi
-    fi
-}
-
-rotate_backups() {
-    local backup_dir="$1"
-    log "Rotating backups in $backup_dir"
-
-    local file_count=$(find "$backup_dir" -maxdepth 1 -name "*.enc" -type f 2>/dev/null | wc -l)
-    log_verbose "Found $file_count backup files in $backup_dir"
-
-    local daily="$RETENTION_DAILY"
-    local weekly="$RETENTION_WEEKLY"
-    local monthly="$RETENTION_MONTHLY"
-
-    local tmp_file
-    if ! tmp_file=$(mktemp -p "$TMP_DIR" backup_rotate_XXXXXX 2>/dev/null); then
-        tmp_file="${TMP_DIR}/backup_rotate_$$_$RANDOM"
-    fi
-    local grouped_file="${tmp_file}.grouped"
-
-    find "$backup_dir" -maxdepth 1 -name "*.enc" -type f > "$tmp_file" 2>/dev/null
-
-    while IFS= read -r encfile; do
-        basename=$(basename "$encfile")
-        type=$(echo "$basename" | sed -E 's/_[0-9]{8}_[0-9]{6}\.tar\.gz\.enc$//')
-        if [[ "$type" == "$basename" ]]; then
-            type=$(echo "$basename" | sed -E 's/\.tar\.gz\.enc$//')
-        fi
-        type=$(echo "$type" | sed -E 's/_(full|inc)$//')
-        echo "$type|$encfile"
-    done < "$tmp_file" 2>/dev/null | sort > "$grouped_file" 2>/dev/null
-
-    local types=$(cut -d'|' -f1 "$grouped_file" 2>/dev/null | sort -u)
-
-    for type in $types; do
-        log_verbose "Processing type: $type"
-        
-        local files=()
-        while IFS= read -r f; do
-            files+=("$f")
-        done < <(grep "^${type}|" "$grouped_file" 2>/dev/null | cut -d'|' -f2 | sort)
-
-        local weekly_kept=()
-        local monthly_kept=()
-
-        for f in "${files[@]}"; do
-            age=$(get_backup_age_days "$f")
-            
-            if (( age <= daily )); then
-                log_verbose "Keeping (daily): $f (age $age days)"
-                continue
-            fi
-            
-            if (( age <= 7 * weekly )); then
-                week_num=$(( (age - 1) / 7 ))
-                local already_kept=false
-                for kept in "${weekly_kept[@]}"; do
-                    if [[ "$kept" == "w$week_num" ]]; then
-                        already_kept=true
-                        break
-                    fi
-                done
-                if [[ "$already_kept" == "false" ]]; then
-                    weekly_kept+=("w$week_num")
-                    log_verbose "Keeping (weekly): $f (age $age days, week $week_num)"
-                    continue
-                else
-                    log_verbose "Skipping (weekly duplicate): $f (age $age days, week $week_num)"
-                fi
-            fi
-            
-            if (( age <= 30 * monthly )); then
-                month_num=$(( (age - 1) / 30 ))
-                local already_kept=false
-                for kept in "${monthly_kept[@]}"; do
-                    if [[ "$kept" == "m$month_num" ]]; then
-                        already_kept=true
-                        break
-                    fi
-                done
-                if [[ "$already_kept" == "false" ]]; then
-                    monthly_kept+=("m$month_num")
-                    log_verbose "Keeping (monthly): $f (age $age days, month $month_num)"
-                    continue
-                else
-                    log_verbose "Skipping (monthly duplicate): $f (age $age days, month $month_num)"
-                fi
-            fi
-            
-            log "Deleting old backup: $f (age $age days, exceeds all retention)"
-            rm -f "$f" 2>/dev/null
-            rm -f "${f%.enc}.checksums" 2>/dev/null
-            rm -f "${f%.enc}.enc.checksums" 2>/dev/null
-        done
-    done
-
-    rm -f "$tmp_file" "$grouped_file" 2>/dev/null
-    log "✅ Rotation completed"
 }
 
 verify_backup_integrity() {
@@ -1621,7 +2547,7 @@ verify_all_backups() {
         if ! verify_backup_integrity "$enc_file"; then
             failed=$((failed + 1))
         fi
-    done < <(find "$backup_dir" -name "*.enc" -type f 2>/dev/null | sort)
+    done < <(find "$backup_dir" -type f -name "*.enc" 2>/dev/null | sort)
     
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -1660,7 +2586,7 @@ deduplicate_backups() {
     case "$DEDUP_TOOL" in
         hardlink)
             if hardlink "$backup_dir" >/dev/null 2>&1; then
-                local total_files=$(find "$backup_dir" -name "*.enc" -type f 2>/dev/null | wc -l)
+                local total_files=$(find "$backup_dir" -type f -name "*.enc" 2>/dev/null | wc -l)
                 local duration=$(( $(date +%s) - start_time ))
                 log "✅ Deduplication complete: $total_files .enc files processed (${duration}s)"
                 return 0
@@ -1671,7 +2597,7 @@ deduplicate_backups() {
             ;;
         jdupes)
             if jdupes -L -r "$backup_dir" >/dev/null 2>&1; then
-                local total_files=$(find "$backup_dir" -name "*.enc" -type f 2>/dev/null | wc -l)
+                local total_files=$(find "$backup_dir" -type f -name "*.enc" 2>/dev/null | wc -l)
                 local duration=$(( $(date +%s) - start_time ))
                 log "✅ Deduplication complete: $total_files .enc files processed (${duration}s)"
                 return 0
@@ -1687,203 +2613,127 @@ deduplicate_backups() {
     esac
 }
 
-restore_from_backup() {
-    local enc_file="$1"
-    if [[ ! -f "$enc_file" ]]; then
-        error_exit "Backup file not found: $enc_file"
-    fi
-
-    init_tmp
-
-    local restore_files
-    mapfile -t restore_files < <(get_restore_file_list "$enc_file") || error_exit "Failed to determine restore files"
-
-    if [[ ${#restore_files[@]} -eq 0 ]]; then
-        error_exit "No files to restore"
-    fi
-
-    log "🔄 Restoring from ${#restore_files[@]} backup(s):"
-    for f in "${restore_files[@]}"; do
-        log "   - $(basename "$f")"
-    done
-
-    local staging_dir
-    staging_dir=$(mktemp -d -p "$TMP_DIR" restore_staging_XXXXXX)
-    trap 'rm -rf "$staging_dir" 2>/dev/null; cleanup_temp; exit' INT TERM EXIT
-
-    local first_file="${restore_files[0]}"
-    local base_name timestamp type
-    parse_backup_filename "$first_file"
-    local base="$BASE"
-
-    local restore_type=""
-    local dest_dir=""
-    local volume_name=""
-    if [[ "$base" == "digital-independence" ]] || [[ "$base" == "$(basename "$SOURCE_DIR")" ]]; then
-        restore_type="dir"
-        dest_dir="${SOURCE_DIR%/}"
-    elif [[ "$base" =~ ^volume_ ]]; then
-        restore_type="volume"
-        volume_name="${base#volume_}"
+get_backup_age_days() {
+    local filepath="$1"
+    local filename=$(basename "$filepath")
+    local date_str=$(echo "$filename" | grep -oE '[0-9]{8}_[0-9]{6}' | head -1)
+    if [[ -z "$date_str" ]]; then
+        local mtime=$(stat -c %Y "$filepath" 2>/dev/null || stat -f %m "$filepath" 2>/dev/null)
+        if [[ -n "$mtime" ]]; then
+            local now=$(date +%s)
+            echo $(( (now - mtime) / 86400 ))
+        else
+            echo 9999
+        fi
     else
-        restore_type="dir"
-        dest_dir="${SOURCE_DIR%/}"
+        local file_epoch=$(date -d "${date_str:0:8} ${date_str:9:2}:${date_str:11:2}:${date_str:13:2}" +%s 2>/dev/null || echo 0)
+        if [[ $file_epoch -eq 0 ]]; then
+            echo 9999
+        else
+            local now=$(date +%s)
+            echo $(( (now - file_epoch) / 86400 ))
+        fi
     fi
-
-    local old_stats=""
-    if [[ -n "$dest_dir" ]] && [[ -d "$dest_dir" ]]; then
-        old_stats="$(get_restore_stats "$dest_dir")"
-    fi
-
-    local checksum_ok=true
-    local checksum_failed=0
-
-    for enc in "${restore_files[@]}"; do
-        log "📦 Processing: $(basename "$enc")"
-        local decrypted_gz="${staging_dir}/$(basename "${enc%.enc}")"
-        log "🔐 Decrypting..."
-        decrypt_file "$enc" "$decrypted_gz" || error_exit "Decryption failed for $enc"
-
-        local checksum_file="${enc%.enc}.checksums"
-        if [[ -f "$checksum_file" ]]; then
-            local stored_sha=$(grep '^SHA256:' "$checksum_file" | awk '{print $2}')
-            local current_sha=$(sha256sum "$decrypted_gz" | awk '{print $1}')
-            if [[ "$stored_sha" != "$current_sha" ]]; then
-                log "❌ Checksum MISMATCH for $(basename "$enc")"
-                log "   Stored:  $stored_sha"
-                log "   Current: $current_sha"
-                checksum_ok=false
-                checksum_failed=$((checksum_failed + 1))
-            else
-                log "✅ Checksum verified: $(basename "$enc")"
-            fi
-        else
-            log "⚠️ No checksum file found for $(basename "$enc")"
-        fi
-
-        log "🗜️ Decompressing..."
-        gunzip -f "$decrypted_gz" || error_exit "Gunzip failed"
-        local tar_file="${decrypted_gz%.gz}"
-        if [[ ! -f "$tar_file" ]]; then
-            error_exit "Tar file not found after decompression"
-        fi
-
-        log "📂 Extracting to staging..."
-        tar -xf "$tar_file" -C "$staging_dir" --overwrite --preserve-permissions 2>/dev/null || \
-            tar -xf "$tar_file" -C "$staging_dir" --overwrite 2>/dev/null || \
-            error_exit "Failed to extract tar"
-
-        rm -f "$tar_file" "$decrypted_gz" 2>/dev/null
-    done
-
-    log "✅ All backups extracted to staging: $staging_dir"
-
-    local staging_stats
-    IFS='|' read -r staging_files staging_dirs staging_size <<< "$(get_restore_stats "$staging_dir")"
-
-    if [[ "$restore_type" == "dir" ]]; then
-        mkdir -p "$dest_dir" 2>/dev/null || sudo mkdir -p "$dest_dir" 2>/dev/null
-        
-        log "📁 Restoring directory to $dest_dir"
-        
-        if command -v rsync &>/dev/null; then
-            rsync -a --no-owner --no-group "$staging_dir/" "$dest_dir/" 2>/dev/null
-        else
-            cp -a "$staging_dir/." "$dest_dir/" 2>/dev/null
-        fi
-        
-        local new_stats
-        IFS='|' read -r new_files new_dirs new_size <<< "$(get_restore_stats "$dest_dir")"
-        
-        log ""
-        log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        log "📊 RESTORE SUMMARY"
-        log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        log "📂 Destination: $dest_dir"
-        log "📁 Directories: $new_dirs"
-        log "📄 Files:       $new_files"
-        log "💾 Total size:  $(human_size $new_size)"
-        log ""
-        
-        if [[ -n "$old_stats" ]]; then
-            IFS='|' read -r old_files old_dirs old_size <<< "$old_stats"
-            local changed_files=$((new_files - old_files))
-            local changed_dirs=$((new_dirs - old_dirs))
-            if [[ $changed_files -ne 0 ]] || [[ $changed_dirs -ne 0 ]]; then
-                log "🔄 Changes applied:"
-                [[ $changed_files -ne 0 ]] && log "   Files:     $([ $changed_files -gt 0 ] && echo "+$changed_files" || echo "$changed_files")"
-                [[ $changed_dirs -ne 0 ]] && log "   Directories: $([ $changed_dirs -gt 0 ] && echo "+$changed_dirs" || echo "$changed_dirs")"
-            else
-                log "ℹ️  No changes detected (already up-to-date)"
-            fi
-        fi
-        
-        log ""
-        if [[ "$checksum_ok" == "true" ]]; then
-            log "🔐 Checksum: ✅ ALL VERIFIED (${#restore_files[@]} files)"
-        else
-            log "🔐 Checksum: ⚠️ $checksum_failed of ${#restore_files[@]} failed verification!"
-        fi
-        
-        log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        log "✅ Directory restore completed to $dest_dir"
-
-    elif [[ "$restore_type" == "volume" ]]; then
-        log "📦 Restoring Docker volume: $volume_name"
-        if ! docker volume inspect "$volume_name" &>/dev/null; then
-            docker volume create "$volume_name" || error_exit "Failed to create volume $volume_name"
-            log "📦 Created volume: $volume_name"
-        fi
-
-        local container_name="chantik_restore_vol_${volume_name}_$(date +%s)_$$"
-        docker run -d --name "$container_name" -v "$volume_name":/volume "$DOCKER_IMAGE" sleep infinity 2>/dev/null || \
-            docker run -d --name "$container_name" -v "$volume_name":/volume alpine sleep infinity 2>/dev/null || \
-            error_exit "Cannot create restore container"
-
-        docker cp "$staging_dir/." "$container_name:/volume/" 2>/dev/null || \
-            docker cp "$staging_dir" "$container_name:/volume/" 2>/dev/null || \
-            error_exit "Failed to copy data to volume"
-
-        docker stop "$container_name" >/dev/null 2>&1
-        docker rm "$container_name" >/dev/null 2>&1
-        
-        log ""
-        log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        log "📊 RESTORE SUMMARY"
-        log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        log "🐳 Volume: $volume_name"
-        log "📁 Directories: $staging_dirs"
-        log "📄 Files:       $staging_files"
-        log "💾 Total size:  $(human_size $staging_size)"
-        log ""
-        if [[ "$checksum_ok" == "true" ]]; then
-            log "🔐 Checksum: ✅ ALL VERIFIED (${#restore_files[@]} files)"
-        else
-            log "🔐 Checksum: ⚠️ $checksum_failed of ${#restore_files[@]} failed verification!"
-        fi
-        log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        log "✅ Volume restore completed for $volume_name"
-    else
-        error_exit "Unknown restore type"
-    fi
-
-    rm -rf "$staging_dir" 2>/dev/null
-    trap - INT TERM EXIT
-
-    local restore_msg="📁 Restored from ${#restore_files[@]} backup(s)\n"
-    restore_msg+="📂 Type: $restore_type\n"
-    restore_msg+="📄 Files: $staging_files\n"
-    restore_msg+="📁 Directories: $staging_dirs\n"
-    restore_msg+="💾 Size: $(human_size $staging_size)\n"
-    restore_msg+="🔐 Checksum: $([ "$checksum_ok" == "true" ] && echo "✅ ALL VERIFIED" || echo "⚠️ $checksum_failed FAILED")\n"
-    restore_msg+="⏱️ Time: $(date '+%Y-%m-%d %H:%M:%S')\n"
-    restore_msg+="✅ Status: Restore completed successfully"
-    send_ntfy "$restore_msg" "restore"
-
-    log "✅ Restore completed successfully."
 }
 
-list_backups() {
+rotate_backups() {
+    local backup_dir="$1"
+    log "Rotating backups in $backup_dir"
+
+    local file_count=$(find "$backup_dir" -type f -name "*.enc" 2>/dev/null | wc -l)
+    log_verbose "Found $file_count backup files in $backup_dir"
+
+    local daily="$RETENTION_DAILY"
+    local weekly="$RETENTION_WEEKLY"
+    local monthly="$RETENTION_MONTHLY"
+
+    local tmp_file
+    if ! tmp_file=$(mktemp -p "$TMP_DIR" backup_rotate_XXXXXX 2>/dev/null); then
+        tmp_file="${TMP_DIR}/backup_rotate_$$_$RANDOM"
+    fi
+    local grouped_file="${tmp_file}.grouped"
+
+    find "$backup_dir" -type f -name "*.enc" > "$tmp_file" 2>/dev/null
+
+    while IFS= read -r encfile; do
+        basename=$(basename "$encfile")
+        type=$(echo "$basename" | sed -E 's/_[0-9]{8}_[0-9]{6}\.tar\.gz\.enc$//')
+        if [[ "$type" == "$basename" ]]; then
+            type=$(echo "$basename" | sed -E 's/\.tar\.gz\.enc$//')
+        fi
+        type=$(echo "$type" | sed -E 's/_(full|inc)$//')
+        echo "$type|$encfile"
+    done < "$tmp_file" 2>/dev/null | sort > "$grouped_file" 2>/dev/null
+
+    local types=$(cut -d'|' -f1 "$grouped_file" 2>/dev/null | sort -u)
+
+    for type in $types; do
+        log_verbose "Processing type: $type"
+        
+        local files=()
+        while IFS= read -r f; do
+            files+=("$f")
+        done < <(grep "^${type}|" "$grouped_file" 2>/dev/null | cut -d'|' -f2 | sort)
+
+        local weekly_kept=()
+        local monthly_kept=()
+
+        for f in "${files[@]}"; do
+            age=$(get_backup_age_days "$f")
+            
+            if (( age <= daily )); then
+                log_verbose "Keeping (daily): $f (age $age days)"
+                continue
+            fi
+            
+            if (( age <= 7 * weekly )); then
+                week_num=$(( (age - 1) / 7 ))
+                local already_kept=false
+                for kept in "${weekly_kept[@]}"; do
+                    if [[ "$kept" == "w$week_num" ]]; then
+                        already_kept=true
+                        break
+                    fi
+                done
+                if [[ "$already_kept" == "false" ]]; then
+                    weekly_kept+=("w$week_num")
+                    log_verbose "Keeping (weekly): $f (age $age days, week $week_num)"
+                    continue
+                else
+                    log_verbose "Skipping (weekly duplicate): $f (age $age days, week $week_num)"
+                fi
+            fi
+            
+            if (( age <= 30 * monthly )); then
+                month_num=$(( (age - 1) / 30 ))
+                local already_kept=false
+                for kept in "${monthly_kept[@]}"; do
+                    if [[ "$kept" == "m$month_num" ]]; then
+                        already_kept=true
+                        break
+                    fi
+                done
+                if [[ "$already_kept" == "false" ]]; then
+                    monthly_kept+=("m$month_num")
+                    log_verbose "Keeping (monthly): $f (age $age days, month $month_num)"
+                    continue
+                else
+                    log_verbose "Skipping (monthly duplicate): $f (age $age days, month $month_num)"
+                fi
+            fi
+            
+            log "Deleting old backup: $f (age $age days, exceeds all retention)"
+            rm -f "$f" 2>/dev/null
+            rm -f "${f%.enc}.checksums" 2>/dev/null
+            rm -f "${f%.enc}.enc.checksums" 2>/dev/null
+        done
+    done
+
+    rm -f "$tmp_file" "$grouped_file" 2>/dev/null
+    log "✅ Rotation completed"
+}
+
+chantik_list_backups() {
     local backup_dir="$1"
     echo ""
     echo "📦 Available backups in: $backup_dir"
@@ -1894,7 +2744,18 @@ list_backups() {
         found=true
         local basename=$(basename "$enc_file")
         local size=$(human_size $(stat -c%s "$enc_file" 2>/dev/null || echo 0))
-        local date=$(echo "$basename" | grep -o '[0-9]\{8\}_[0-9]\{6\}' | sed 's/_/ /' | head -1)
+        
+        local date_str=$(echo "$basename" | grep -o '[0-9]\{8\}_[0-9]\{6\}' | head -1)
+        local formatted_date=""
+        if [[ -n "$date_str" ]]; then
+            local year="${date_str:0:4}"
+            local month="${date_str:4:2}"
+            local day="${date_str:6:2}"
+            local hour="${date_str:9:2}"
+            local minute="${date_str:11:2}"
+            local second="${date_str:13:2}"
+            formatted_date="$year-$month-$day $hour:$minute:$second"
+        fi
         
         local backup_type=""
         if [[ "$basename" == *_full* ]]; then
@@ -1913,8 +2774,8 @@ list_backups() {
             status="⚠️"
         fi
         
-        printf "  %s %s %-55s  %-10s  %s\n" "$status" "$backup_type" "$basename" "$size" "$date"
-    done < <(find "$backup_dir" -name "*.enc" -type f 2>/dev/null | sort)
+        printf "  %s %s %-55s  %-10s  %s\n" "$status" "$backup_type" "$basename" "$size" "$formatted_date"
+    done < <(find "$backup_dir" -type f -name "*.enc" 2>/dev/null | sort)
     
     if [[ "$found" == "false" ]]; then
         echo "  ⚠️  No backups found in: $backup_dir"
@@ -1941,40 +2802,44 @@ do_backup() {
     load_config
     init_tmp
     
+    local runtime=$(detect_container_runtime)
+    CONTAINER_RUNTIME="$runtime"
+    log "🐳 Container runtime: $runtime"
+    
     local hostname=$(hostname)
     local source_size=$(get_dir_size "$SOURCE_DIR")
     local source_size_human=$(human_size "$source_size")
     local source_files=$(get_file_count "$SOURCE_DIR")
     local source_dirs=$(find "$SOURCE_DIR" -type d 2>/dev/null | wc -l)
-    local volume_count=${#DOCKER_VOLUMES[@]}
+    
+    local volume_count=0
+    if [[ ${#DOCKER_VOLUMES[@]} -gt 0 ]]; then
+        volume_count=$((volume_count + ${#DOCKER_VOLUMES[@]}))
+    fi
+    if [[ ${#PODMAN_VOLUMES[@]} -gt 0 ]] && [[ "$runtime" == "podman" ]]; then
+        volume_count=$((volume_count + ${#PODMAN_VOLUMES[@]}))
+    fi
+    
     local free_space_mb
     free_space_mb=$(df -m "$BACKUP_BASE_DIR" | awk 'NR==2 {print $4}')
     local free_space_human=$(human_size $((free_space_mb * 1024 * 1024)))
     
     log "📁 Source: $SOURCE_DIR"
-    log "📊 Size: $source_size_human ($source_files files, $source_dirs directories)"
+    log "📊 Size: $source_size_human ($source_files files, $source_dirs dirs)"
     log "🐳 Volumes: $volume_count volumes"
     log "💾 Target: $BACKUP_BASE_DIR"
-    log "💿 Free space: $free_space_human"
-    log "🔒 Encryption: ${ENCRYPTION_CIPHER^^} (Chantik Mode)"
-    log "🔑 PBKDF2 iterations: ${PBKDF2_ITERATIONS:-600000}"
-    if [[ -n "$FIXED_NONCE" ]]; then
-        log "🔗 Deduplication: ENABLED (fixed nonce)"
-    else
-        log "🔗 Deduplication: DISABLED (random nonce)"
-    fi
+    log "💿 Free: $free_space_human"
+    log "🔒 Encryption: ${ENCRYPTION_CIPHER^^}"
+    log "🔑 PBKDF2: ${PBKDF2_ITERATIONS:-600000}"
+    log "🔗 Dedup: $([ -n "$FIXED_NONCE" ] && echo "ENABLED" || echo "DISABLED")"
     log "🗜️ Compression: gzip level $GZIP_LEVEL"
-    log "📋 Retention: Daily=${RETENTION_DAILY}, Weekly=${RETENTION_WEEKLY}, Monthly=${RETENTION_MONTHLY}"
+    log "📋 Retention: D${RETENTION_DAILY}/W${RETENTION_WEEKLY}/M${RETENTION_MONTHLY}"
+    log "🔄 Incremental: $([ "$INCREMENTAL_ENABLED" == "true" ] && echo "ENABLED (${FULL_BACKUP_INTERVAL} days)" || echo "DISABLED")"
     
-    if [[ "$INCREMENTAL_ENABLED" == "true" ]]; then
-        log "🔄 Incremental: ENABLED (full backup every ${FULL_BACKUP_INTERVAL} days)"
-    else
-        log "🔄 Incremental: DISABLED (always full backup)"
-    fi
+    send_ntfy "📅 $start_date\n💻 $hostname\n📁 $SOURCE_DIR\n📊 $source_size_human ($source_files files, $source_dirs dirs)\n🐳 $volume_count volumes\n🐳 Runtime: $runtime\n💾 $BACKUP_BASE_DIR\n💿 Free: $free_space_human\n🔒 ${ENCRYPTION_CIPHER^^}\n🔑 PBKDF2: ${PBKDF2_ITERATIONS:-600000}\n🔗 Dedup: $([ -n "$FIXED_NONCE" ] && echo "ENABLED" || echo "DISABLED")\n🗜️ gzip $GZIP_LEVEL\n📋 Retention: D${RETENTION_DAILY}/W${RETENTION_WEEKLY}/M${RETENTION_MONTHLY}\n🔄 $([ "$INCREMENTAL_ENABLED" == "true" ] && echo "ENABLED (${FULL_BACKUP_INTERVAL} days)" || echo "DISABLED")" "info"
     
-    send_ntfy "📅 Time: $start_date\n💻 Host: $hostname\n📁 Source: $SOURCE_DIR\n📊 Size: $source_size_human ($source_files files, $source_dirs directories)\n🐳 Volumes: $volume_count volumes\n💾 Target: $BACKUP_BASE_DIR\n💿 Free space: $free_space_human\n🔒 Encryption: ${ENCRYPTION_CIPHER^^} (Chantik Mode)\n🔑 PBKDF2: ${PBKDF2_ITERATIONS:-600000} iterations\n🔗 Dedup: $([ -n "$FIXED_NONCE" ] && echo "ENABLED" || echo "DISABLED")\n🗜️ Compression: gzip level $GZIP_LEVEL\n📋 Retention: Daily=${RETENTION_DAILY}, Weekly=${RETENTION_WEEKLY}, Monthly=${RETENTION_MONTHLY}\n🔄 Incremental: $([ "$INCREMENTAL_ENABLED" == "true" ] && echo "ENABLED (${FULL_BACKUP_INTERVAL} days)" || echo "DISABLED")" "info"
     acquire_lock
-    check_docker
+    check_container_runtime
     check_disk_space "$BACKUP_BASE_DIR" 1024
 
     local timestamp
@@ -1985,28 +2850,69 @@ do_backup() {
 
     backup_directory_incremental "$SOURCE_DIR" "$backup_dir" "digital-independence"
 
-    local pids=()
     local failed=0
     local vol_count=0
     local vol_success=0
-
+    
     for vol in "${DOCKER_VOLUMES[@]}"; do
         vol_count=$((vol_count + 1))
-        log "Processing volume $vol_count of ${#DOCKER_VOLUMES[@]}: $vol"
-        backup_docker_volume_incremental "$vol" "$backup_dir" &
-        pids+=($!)
-    done
-
-    for pid in "${pids[@]}"; do
-        if wait $pid; then
+        log "📦 Docker volume $vol_count/${#DOCKER_VOLUMES[@]}: $vol"
+        
+        local vol_runtime="$runtime"
+        if [[ "$runtime" == "podman" ]] && ! volume_exists "podman" "$vol"; then
+            if volume_exists "docker" "$vol"; then
+                log "Volume $vol exists in Docker, using Docker"
+                vol_runtime="docker"
+            else
+                log "⚠️ Volume $vol not found, skipping..."
+                failed=$((failed + 1))
+                continue
+            fi
+        fi
+        
+        if backup_container_volume "$vol_runtime" "$vol" "$backup_dir"; then
             vol_success=$((vol_success + 1))
+            log "✅ Volume $vol backed up successfully"
         else
+            log "❌ Failed to backup volume: $vol"
             failed=$((failed + 1))
         fi
     done
 
+    if [[ "$runtime" == "podman" ]]; then
+        for vol in "${PODMAN_VOLUMES[@]}"; do
+            local already_processed=false
+            for processed in "${DOCKER_VOLUMES[@]}"; do
+                if [[ "$processed" == "$vol" ]]; then
+                    already_processed=true
+                    break
+                fi
+            done
+            [[ "$already_processed" == "true" ]] && continue
+            
+            vol_count=$((vol_count + 1))
+            log "📦 Podman volume $vol_count: $vol"
+            
+            if ! volume_exists "podman" "$vol"; then
+                log "⚠️ Podman volume $vol not found, skipping..."
+                failed=$((failed + 1))
+                continue
+            fi
+            
+            if backup_container_volume "podman" "$vol" "$backup_dir"; then
+                vol_success=$((vol_success + 1))
+                log "✅ Podman volume $vol backed up successfully"
+            else
+                log "❌ Failed to backup Podman volume: $vol"
+                failed=$((failed + 1))
+            fi
+        done
+    fi
+
     if [[ $failed -gt 0 ]]; then
-        log "⚠️ WARNING: $failed volume backup(s) failed"
+        log "⚠️ WARNING: $failed of $vol_count volume backup(s) failed"
+    else
+        log "✅ All $vol_count volumes backed up successfully"
     fi
 
     check_backup_size "$backup_dir"
@@ -2027,9 +2933,9 @@ do_backup() {
             fi
         done
         if $all_ok; then
-            log "✅ All backups verified ($verified_count files)."
+            log "✅ All backups verified ($verified_count files)"
         else
-            log "⚠️ WARNING: $failed_verify of $verified_count backups failed verification."
+            log "⚠️ WARNING: $failed_verify of $verified_count backups failed verification"
         fi
     else
         log "⚠️ WARNING: No encrypted backup files found in $backup_dir"
@@ -2069,38 +2975,22 @@ do_backup() {
         fi
     done
 
-    log_section "📊 BACKUP SUMMARY"
-    log "📂 Location: $backup_dir"
-    log "📁 Directories backed up: $source_dirs"
-    log "📄 Files backed up: $source_files"
-    log "💾 Source size: $source_size_human"
-    log ""
-    log "📦 Backup archives:"
-    log "   FULL backups:      $full_count file(s) ($(human_size $full_size))"
-    log "   INCREMENTAL backups: $inc_count file(s) ($(human_size $inc_size))"
-    log "   Total:             $backup_count file(s) ($total_backup_size_human)"
-    log ""
-    log "🔐 Verification:"
-    if [[ $failed_verify -eq 0 ]] && [[ $backup_count -gt 0 ]]; then
-        log "   ✅ All $verified_count backup(s) verified successfully"
-    elif [[ $backup_count -gt 0 ]]; then
-        log "   ⚠️  $failed_verify of $verified_count backup(s) failed verification"
-    else
-        log "   ⚠️  No backups to verify"
-    fi
-    log ""
-    log "💿 Storage:"
-    log "   Before: $free_space_human"
-    log "   Used:   $space_used_human"
-    log "   After:  $(human_size $((new_free_space_mb * 1024 * 1024)))"
-    log ""
-    if [[ "$INCREMENTAL_ENABLED" == "true" ]]; then
-        log "🔄 Incremental mode:"
-        log "   Full backup interval: ${FULL_BACKUP_INTERVAL} days"
-        log "   Next full backup due: $(date -d "+${FULL_BACKUP_INTERVAL} days" '+%Y-%m-%d' 2>/dev/null || echo "unknown")"
-    fi
-    log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "📊 BACKUP SUMMARY"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "📂 Location: $backup_dir"
+    echo "📁 Source: $source_dirs dirs, $source_files files ($source_size_human)"
+    echo "📦 Archives: $backup_count encrypted files"
+    echo "   FULL: $full_count ($(human_size $full_size))"
+    echo "   INC:  $inc_count ($(human_size $inc_size))"
+    echo "   Total: $total_backup_size_human"
+    echo "🔐 Verification: $([ $failed_verify -eq 0 ] && echo "✅ ALL PASSED" || echo "⚠️ $failed_verify FAILED")"
+    echo "💿 Storage: $free_space_human → $(human_size $((new_free_space_mb * 1024 * 1024))) (used $space_used_human)"
+    echo "🐳 Volumes: ${vol_success}/${volume_count} successful"
+    echo "⏱️ Duration: $duration_human"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    
     log_section "✅ Backup completed successfully"
     log "🕊️ $BRAND_NAME — $BRAND_TAGLINE"
     log "⏱️ Duration: $duration_human"
@@ -2110,7 +3000,7 @@ do_backup() {
     log "📝 Log: $LOG_FILE"
     log "🙏 $BRAND_MOTTO"
 
-    send_ntfy "📅 Completed: $end_date\n⏱️ Duration: $duration_human\n📦 Archives: $backup_count encrypted files\n   FULL: $full_count ($(human_size $full_size))\n   INC:  $inc_count ($(human_size $inc_size))\n📁 Source: $source_files files, $source_dirs dirs\n💾 Source size: $source_size_human\n🐳 Volumes: $volume_count volumes (${vol_success} successful)\n🔒 Encryption: ${ENCRYPTION_CIPHER^^} (Chantik Mode)\n🔑 PBKDF2: ${PBKDF2_ITERATIONS:-600000} iterations\n🔗 Dedup: $([ -n "$FIXED_NONCE" ] && echo "ENABLED" || echo "DISABLED")\n🔐 Verification: $([ $failed_verify -eq 0 ] && echo "✅ ALL PASSED" || echo "⚠️ $failed_verify FAILED")\n📋 Retention: D${RETENTION_DAILY}/W${RETENTION_WEEKLY}/M${RETENTION_MONTHLY}\n💿 Free space: $free_space_human → $(human_size $((new_free_space_mb * 1024 * 1024))) (used $space_used_human)\n📂 Location: $backup_dir" "success"
+    send_ntfy "📅 Completed: $end_date\n⏱️ Duration: $duration_human\n📦 $backup_count files (F:$full_count/I:$inc_count)\n📁 $source_files files, $source_dirs dirs\n💾 $total_backup_size_human\n🐳 Volumes: ${vol_success}/${volume_count} successful\n🔐 Verification: $([ $failed_verify -eq 0 ] && echo "✅ ALL PASSED" || echo "⚠️ $failed_verify FAILED")\n💿 Free: $free_space_human → $(human_size $((new_free_space_mb * 1024 * 1024)))\n📂 $backup_dir" "success"
     
     release_lock
     cleanup_temp
@@ -2124,6 +3014,11 @@ run_test() {
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "💬 $BRAND_TAGLINE"
     echo "🙏 $BRAND_MOTTO"
+    echo ""
+    
+    echo "🐳 Testing container runtime detection..."
+    local runtime=$(detect_container_runtime)
+    echo "   Detected runtime: $runtime"
     echo ""
     
     if [[ ! -f "$ENCRYPTION_KEY_FILE" ]]; then
@@ -2269,6 +3164,7 @@ run_test() {
     if [[ -n "$FIXED_NONCE" ]]; then
         echo "  • Fixed nonce deduplication: ✅"
     fi
+    echo "  • Container runtime detection: ✅ ($runtime)"
     echo ""
     echo "📁 Test files kept in: $TEST_DIR"
     echo "   (Remove with: rm -rf $TEST_DIR)"
@@ -2289,100 +3185,108 @@ show_help() {
     cat <<EOF
 🕊️ $BRAND_NAME v$VERSION
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-💬 $BRAND_TAGLINE
-🙏 $BRAND_MOTTO
+$BRAND_TAGLINE
+$BRAND_MOTTO
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-USAGE:
-    $SCRIPT_NAME [OPTIONS]
+USAGE: $SCRIPT_NAME [COMMAND] [ARGS]
 
-OPTIONS:
-    --restore <file>      Restore from the specified encrypted backup file
-    --verify <file>       Verify integrity of a specific backup file
-    --verify-all          Verify all backups in the backup directory
-    --list                List all available backups
-    --dedup               Run deduplication on the backup directory
-    --test                Run encryption/decryption test suite
-    --help, -h            Show this help message
+COMMANDS:
+  backup              Run backup (default)
+  restore <pattern>   Restore backup(s) - supports partial match
+  list                List all backups
+  verify <file>       Verify backup integrity
+  verify-all          Verify all backups
+  dedup               Run deduplication
+  test                Run encryption test
+  help                Show this help
 
-EXAMPLES:
-    # Perform a full backup
-    ./$SCRIPT_NAME
+RESTORE EXAMPLES:
+  chantik restore postgres          # All postgres backups
+  chantik restore redis full        # All redis full backups
+  chantik restore 20260906          # All backups from date
+  chantik restore vol1 vol2 vol3    # Multiple volumes
+  chantik restore "postgres,redis"  # Comma-separated
 
-    # Perform incremental backup (if enabled in config)
-    ./$SCRIPT_NAME
+CONFIG: chantik.conf (BACKUP_BASE_DIR, SOURCE_DIR, ENCRYPTION_KEY_FILE, etc)
+ENV:    CHANTIK_CONFIG, CHANTIK_WORK_DIR
 
-    # Test encryption/decryption
-    ./$SCRIPT_NAME --test
+ALIAS:  alias chantik="/path/to/chantik.sh"
 
-    # List available backups
-    ./$SCRIPT_NAME --list
-
-    # Verify a specific backup
-    ./$SCRIPT_NAME --verify /path/to/backup.enc
-
-    # Verify all backups
-    ./$SCRIPT_NAME --verify-all
-
-    # Restore from a specific backup
-    ./$SCRIPT_NAME --restore /path/to/backup.enc
-
-    # Run deduplication on backup directory
-    ./$SCRIPT_NAME --dedup
-
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 EOF
 }
 
 main() {
     case "${1:-}" in
-        --test)
+        test)
             load_config
             init_tmp
             run_test
             ;;
-        --restore)
-            if [[ -z "${2:-}" ]]; then
-                echo "🕊️ ERROR: Missing backup file for restore."
-                echo "Usage: $SCRIPT_NAME --restore <backup-file>"
+        restore)
+            shift
+            local dry_run=false
+            if [[ "$1" == "--dry-run" ]]; then
+                dry_run=true
+                shift
+            fi
+            if [[ -z "${1:-}" ]]; then
+                echo "🕊️ ERROR: Missing backup name for restore."
+                echo ""
+                echo "Usage: $SCRIPT_NAME restore [--dry-run] <name> [name2] [name3] ..."
+                echo ""
+                echo "Examples:"
+                echo "  $SCRIPT_NAME restore volume_postgres volume_redis"
+                echo "  $SCRIPT_NAME restore postgres redis"
+                echo "  $SCRIPT_NAME restore 20260906"
+                echo "  $SCRIPT_NAME restore --dry-run volume_postgres"
+                echo ""
+                echo "Available backups:"
+                chantik_list_backups "$BACKUP_BASE_DIR"
                 exit 1
             fi
             load_config
             init_tmp
-            restore_from_backup "$2"
+            if [[ "$dry_run" == "true" ]]; then
+                restore_from_backup --dry-run "$@"
+            else
+                restore_from_backup "$@"
+            fi
             ;;
-        --verify)
+        verify)
             if [[ -z "${2:-}" ]]; then
                 echo "🕊️ ERROR: Missing backup file for verification."
-                echo "Usage: $SCRIPT_NAME --verify <backup-file>"
+                echo "Usage: $SCRIPT_NAME verify <backup-file>"
                 exit 1
             fi
             load_config
             init_tmp
             verify_backup_integrity "$2"
             ;;
-        --verify-all)
+        verify-all)
             load_config
             init_tmp
             verify_all_backups "$BACKUP_BASE_DIR"
             ;;
-        --list)
+        list)
             load_config
-            list_backups "$BACKUP_BASE_DIR"
+            chantik_list_backups "$BACKUP_BASE_DIR"
             ;;
-        --dedup)
+        dedup)
             load_config
             init_tmp
             deduplicate_backups "$BACKUP_BASE_DIR"
             ;;
-        --help|-h)
+        help|-h|--help)
             show_help
             ;;
         "")
             do_backup
             ;;
         *)
-            echo "🕊️ ERROR: Unknown option: $1"
-            echo "Use --help for usage information."
+            echo "🕊️ ERROR: Unknown command: $1"
+            echo "Use '$SCRIPT_NAME help' for usage information."
             exit 1
             ;;
     esac

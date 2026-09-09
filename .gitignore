@@ -10,3 +10,4 @@ backup/
 fixed_salt.txt
 test_backup_restore.sh
 test_backup_restore_volume.sh
+.chantik.lock.dir
