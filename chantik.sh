@@ -39,7 +39,7 @@ if [[ ! -f "$CONFIG_FILE" ]] && [[ -f "/etc/chantik/chantik.conf" ]]; then
     CONFIG_FILE="/etc/chantik/chantik.conf"
 fi
 
-CONFIG_EXAMPLE="${SCRIPT_DIR}/chantik.conf.example"
+CONFIG_EXAMPLE="${SCRIPT_DIR}/chantik.example.conf"
 
 if [[ -n "${CHANTIK_WORK_DIR:-}" ]]; then
     WORK_DIR="${CHANTIK_WORK_DIR}"

@@ -1,13 +1,13 @@
-<h1 align="center">🕊️ Chantik</h1>
+# 🕊️ Chantik
 
 <p align="center">
-  <strong>ChaCha20-Authenticated Backup Protection untuk Direktori dan Volume Docker/Podman</strong><br>
-  dengan enkripsi terotentikasi, kompresi, retensi cerdas, backup inkremental, deduplikasi, dan notifikasi waktu-nyata.
+  <strong>ChaCha20-Authenticated Backup Protection for Docker/Podman Directories and Volumes</strong><br>
+  with authenticated encryption, compression, smart retention, incremental backups, deduplication, and real-time notifications.
 </p>
 
 <p align="center">
   <a href="https://opensource.org/licenses/MIT">
-    <img src="https://img.shields.io/badge/Lisensi-MIT-yellow.svg" alt="Lisensi: MIT">
+    <img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT">
   </a>
   <a href="https://www.gnu.org/software/bash/">
     <img src="https://img.shields.io/badge/Bash-4EAA25?logo=gnu-bash&logoColor=white" alt="Bash">
@@ -26,117 +26,117 @@
     <img src="https://img.shields.io/badge/Platform-Linux%20%7C%20macOS-important" alt="Platform">
   </a>
   <a href="https://git.ricalnet.my.id/chantik/graphs/commit-activity">
-    <img src="https://img.shields.io/badge/Dipelihara-yes-green.svg" alt="Pemeliharaan">
+    <img src="https://img.shields.io/badge/Maintained-yes-green.svg" alt="Maintenance">
   </a>
 </p>
 
 <hr>
 
-## 🕊️ Ikhtisar
+## 🕊️ Overview
 
-> **Chantik** — Solusi backup yang tangguh, awalnya dibuat untuk proyek [digital-independence](https://git.ricalnet.my.id/digital-independence), kini tersedia untuk penggunaan umum. Chantik memberikan perlindungan dengan enkripsi terotentikasi ChaCha20-Poly1305, kebijakan retensi cerdas, dan fitur otomatisasi yang komprehensif.
+> **Chantik** — A robust backup solution, originally built for the [digital-independence](https://git.ricalnet.my.id/digital-independence) project, now available for general use. Chantik provides protection with ChaCha20-Poly1305 authenticated encryption, smart retention policies, and comprehensive automation features.
 
-### ✨ Fitur Utama
+### ✨ Key Features
 
-| Fitur | Deskripsi |
+| Feature | Description |
 |---------|-------------|
-| 🔐 Enkripsi Terotentikasi | ChaCha20-Poly1305 (utama) dengan fallback AES-256-CBC |
-| 🔑 Derivasi Kunci Kuat | PBKDF2 dengan iterasi yang dapat dikonfigurasi (default: 600.000) |
-| 🔗 Deduplikasi | Dukungan nonce tetap untuk enkripsi deterministik |
-| 🗜️ Kompresi | Gzip dengan tingkat yang dapat dikonfigurasi (1-9) |
-| 🐳 Dukungan Container | Backup dan pemulihan volume Docker dan Podman |
-| 🔄 Backup Inkremental | Hemat penyimpanan dan percepat backup |
-| 📊 Retensi Cerdas | Kebijakan retensi harian, mingguan, dan bulanan |
-| 🔔 Notifikasi Waktu-nyata | Peringatan instan melalui ntfy.sh |
-| ✅ Verifikasi Integritas | Verifikasi checksum SHA256 untuk setiap backup |
-| 🔒 Keamanan | Izin yang dapat dikonfigurasi dan penguncian proses |
-| 📝 Pencatatan Komprehensif | Log terperinci untuk audit dan pemecahan masalah |
-| 🎯 Multi-Container Runtime | Mendukung Docker dan Podman secara otomatis |
+| 🔐 Authenticated Encryption | ChaCha20-Poly1305 (primary) with AES-256-CBC fallback |
+| 🔑 Strong Key Derivation | PBKDF2 with configurable iterations (default: 600,000) |
+| 🔗 Deduplication | Fixed nonce support for deterministic encryption |
+| 🗜️ Compression | Gzip with configurable level (1-9) |
+| 🐳 Container Support | Backup and restore Docker and Podman volumes |
+| 🔄 Incremental Backup | Saves storage and speeds up backups |
+| 📊 Smart Retention | Daily, weekly, and monthly retention policies |
+| 🔔 Real-time Notifications | Instant alerts via ntfy.sh |
+| ✅ Integrity Verification | SHA256 checksum verification for every backup |
+| 🔒 Security | Configurable permissions and process locking |
+| 📝 Comprehensive Logging | Detailed logs for auditing and troubleshooting |
+| 🎯 Multi-Container Runtime | Supports Docker and Podman automatically |
 
-## 🚀 Mulai Cepat
+## 🚀 Quick Start
 
-### Prasyarat
+### Prerequisites
 
-Pastikan sistem Anda memiliki:
+Ensure your system has:
 
 ```bash
 - Bash 4.0+
-- Docker atau Podman (jika melakukan backup volume)
-- OpenSSL dengan dukungan ChaCha20
+- Docker or Podman (if backing up volumes)
+- OpenSSL with ChaCha20 support
 - gzip, tar, curl
 - find, grep, sed, awk
 - df, du, hostname, sha256sum
 ```
 
-### Instalasi
+### Installation
 
-1. Kloning repositori:
+1. Clone the repository:
    ```bash
    git clone https://git.ricalnet.my.id/chantik.git
    cd chantik
    ```
 
-2. Setup alias untuk kemudahan penggunaan:
+2. Set up an alias for ease of use:
    ```bash
-   # Untuk Zsh (umum di macOS dan sebagian besar distro Linux modern)
+   # For Zsh (common on macOS and most modern Linux distros)
    nano ~/.zshrc
    
-   # Atau untuk Bash (default di banyak sistem)
+   # Or for Bash (default on many systems)
    nano ~/.bashrc
    
-   # Tambahkan baris berikut ke file yang sesuai:
+   # Add the following line to the appropriate file:
    alias chantik='/path/to/chantik/chantik.sh'
    
-   # Contoh: jika Anda mengkloning di /home/user/chantik
+   # Example: if you cloned to /home/user/chantik
    alias chantik='/home/user/chantik/chantik.sh'
    
-   # Simpan file dan muat ulang konfigurasi:
-   source ~/.zshrc   # atau source ~/.bashrc
+   # Save the file and reload the configuration:
+   source ~/.zshrc   # or source ~/.bashrc
    
-   # Sekarang Anda dapat menjalankan Chantik dari mana saja:
+   # Now you can run Chantik from anywhere:
    chantik backup
    chantik list
    chantik restore postgres_data
    ```
 
-3. Hasilkan kunci enkripsi:
+3. Generate an encryption key:
    ```bash
    openssl rand -base64 32 > encryption.key
    chmod 600 encryption.key
    ```
 
-4. (Opsional) Hasilkan salt tetap untuk deduplikasi:
+4. (Optional) Generate a fixed salt for deduplication:
    ```bash
    openssl rand -hex 8 > fixed_salt.txt
    chmod 600 fixed_salt.txt
    ```
 
-5. Buat konfigurasi dari contoh:
+5. Create a configuration from the example:
    ```bash
    cp chantik.conf.example chantik.conf
    ```
 
-6. Edit konfigurasi dengan pengaturan Anda:
+6. Edit the configuration with your settings:
    ```bash
    nano chantik.conf
    ```
 
-7. Buat skrip dapat dieksekusi:
+7. Make the script executable:
    ```bash
    chmod +x chantik.sh
    ```
 
-8. Uji sistem enkripsi:
+8. Test the encryption system:
    ```bash
    chantik test
    ```
 
-### Lakukan Backup Pertama
+### Run Your First Backup
 
 ```bash
 chantik backup
 
-# Contoh keluaran:
+# Example output:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [2026-09-09 23:06:03] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [2026-09-09 23:06:03] 🕊️ Starting Chantik (v0.1.4)
@@ -179,54 +179,54 @@ element_nginx_conf_snapshot_19911
 [2026-09-09 23:06:23] ✅ Podman volume element_nginx_conf backed up successfully
 ```
 
-## 📋 Panduan Konfigurasi
+## 📋 Configuration Guide
 
-### Konfigurasi Penting
+### Essential Configuration
 
-| Variabel | Deskripsi | Contoh |
+| Variable | Description | Example |
 |----------|-------------|---------|
-| `BACKUP_BASE_DIR` | Tempat penyimpanan backup terenkripsi | `/media/backup` |
-| `SOURCE_DIR` | Direktori utama yang akan di-backup | `/home/user/digital-independence` |
-| `DOCKER_VOLUMES` | Nama volume Docker | `("postgres_data" "redis_cache")` |
-| `PODMAN_VOLUMES` | Nama volume Podman | `("podman_data" "podman_config")` |
-| `CONTAINER_RUNTIME` | Runtime container (auto/docker/podman) | `auto` |
-| `ENCRYPTION_KEY_FILE` | Jalur ke kunci enkripsi | `/home/user/chantik/encryption.key` |
-| `NTFY_TOPIC` | Topik ntfy.sh untuk notifikasi | `my-backup-topic` |
-| `NTFY_TOKEN` | Token otentikasi ntfy.sh | `tk_xxxxxxxxxxxxxxxx` |
+| `BACKUP_BASE_DIR` | Where encrypted backups are stored | `/media/backup` |
+| `SOURCE_DIR` | Main directory to back up | `/home/user/digital-independence` |
+| `DOCKER_VOLUMES` | Docker volume names | `("postgres_data" "redis_cache")` |
+| `PODMAN_VOLUMES` | Podman volume names | `("podman_data" "podman_config")` |
+| `CONTAINER_RUNTIME` | Container runtime (auto/docker/podman) | `auto` |
+| `ENCRYPTION_KEY_FILE` | Path to encryption key | `/home/user/chantik/encryption.key` |
+| `NTFY_TOPIC` | ntfy.sh topic for notifications | `my-backup-topic` |
+| `NTFY_TOKEN` | ntfy.sh authentication token | `tk_xxxxxxxxxxxxxxxx` |
 
-### Konfigurasi Lanjutan
+### Advanced Configuration
 
-| Variabel | Deskripsi | Default |
+| Variable | Description | Default |
 |----------|-------------|---------|
-| `ENCRYPTION_CIPHER` | Sandi yang digunakan (terdeteksi otomatis) | `chacha20` |
-| `PBKDF2_ITERATIONS` | Iterasi derivasi kunci (100.000+) | `600000` |
-| `FIXED_SALT_FILE` | Salt tetap untuk enkripsi deterministik | (opsional) |
-| `INCREMENTAL_ENABLED` | Aktifkan backup inkremental | `true` |
-| `FULL_BACKUP_INTERVAL` | Hari antara backup penuh | `7` |
-| `RETENTION_DAILY` | Jumlah backup harian yang disimpan | `7` |
-| `RETENTION_WEEKLY` | Jumlah backup mingguan yang disimpan | `4` |
-| `RETENTION_MONTHLY` | Jumlah backup bulanan yang disimpan | `6` |
-| `GZIP_LEVEL` | Tingkat kompresi (1-9) | `6` |
-| `DEDUP_TOOL` | Alat deduplikasi (hardlink/jdupes) | `hardlink` |
-| `VERBOSE` | Aktifkan keluaran debug terperinci | `false` |
-| `BACKUP_PREFIX` | Prefiks direktori backup | `chantik-backup` |
-| `EXCLUDE_PATTERNS` | Pola file/direktori yang dikecualikan | `*.tmp,*.log` |
-| `MAX_BACKUP_SIZE_MB` | Batas ukuran backup maksimum | `0` (tak terbatas) |
-| `NTFY_CUSTOM_SERVER` | URL server ntfy kustom | (kosong) |
-| `DOCKER_IMAGE` | Image untuk container helper | `alpine:latest` |
+| `ENCRYPTION_CIPHER` | Cipher used (auto-detected) | `chacha20` |
+| `PBKDF2_ITERATIONS` | Key derivation iterations (100,000+) | `600000` |
+| `FIXED_SALT_FILE` | Fixed salt for deterministic encryption | (optional) |
+| `INCREMENTAL_ENABLED` | Enable incremental backups | `true` |
+| `FULL_BACKUP_INTERVAL` | Days between full backups | `7` |
+| `RETENTION_DAILY` | Number of daily backups to keep | `7` |
+| `RETENTION_WEEKLY` | Number of weekly backups to keep | `4` |
+| `RETENTION_MONTHLY` | Number of monthly backups to keep | `6` |
+| `GZIP_LEVEL` | Compression level (1-9) | `6` |
+| `DEDUP_TOOL` | Deduplication tool (hardlink/jdupes) | `hardlink` |
+| `VERBOSE` | Enable detailed debug output | `false` |
+| `BACKUP_PREFIX` | Backup directory prefix | `chantik-backup` |
+| `EXCLUDE_PATTERNS` | File/directory exclusion patterns | `*.tmp,*.log` |
+| `MAX_BACKUP_SIZE_MB` | Maximum backup size limit | `0` (unlimited) |
+| `NTFY_CUSTOM_SERVER` | Custom ntfy server URL | (empty) |
+| `DOCKER_IMAGE` | Image for helper container | `alpine:latest` |
 
-### Contoh Konfigurasi
+### Configuration Examples
 
 <details>
-<summary><b>Mengaktifkan Deduplikasi</b></summary>
+<summary><b>Enabling Deduplication</b></summary>
 
-Hasilkan salt tetap:
+Generate a fixed salt:
 ```bash
 openssl rand -hex 8 > fixed_salt.txt
 chmod 600 fixed_salt.txt
 ```
 
-Di `chantik.conf`:
+In `chantik.conf`:
 ```bash
 FIXED_SALT_FILE="/path/to/fixed_salt.txt"
 DEDUP_TOOL="hardlink"
@@ -234,9 +234,9 @@ DEDUP_TOOL="hardlink"
 </details>
 
 <details>
-<summary><b>Menggunakan Podman</b></summary>
+<summary><b>Using Podman</b></summary>
 
-Di `chantik.conf`:
+In `chantik.conf`:
 ```bash
 CONTAINER_RUNTIME="podman"
 PODMAN_VOLUMES=(
@@ -247,174 +247,174 @@ PODMAN_VOLUMES=(
 </details>
 
 <details>
-<summary><b>Server ntfy Kustom</b></summary>
+<summary><b>Custom ntfy Server</b></summary>
 
-Di `chantik.conf`:
+In `chantik.conf`:
 ```bash
-NTFY_CUSTOM_SERVER="https://ntfy.domain-anda.com"
+NTFY_CUSTOM_SERVER="https://ntfy.your-domain.com"
 ```
 </details>
 
-## 🔄 Referensi Perintah
+## 🔄 Command Reference
 
-### Perintah Dasar
+### Basic Commands
 
 ```bash
-# Lakukan backup (penuh atau inkremental berdasarkan konfigurasi)
+# Run a backup (full or incremental based on config)
 chantik backup
 
-# Uji sistem enkripsi/dekripsi
+# Test the encryption/decryption system
 chantik test
 
-# Daftarkan semua backup yang tersedia
+# List all available backups
 chantik list
 
-# Verifikasi integritas backup tertentu
+# Verify the integrity of a specific backup
 chantik verify /path/to/backup.enc
 
-# Verifikasi semua backup
+# Verify all backups
 chantik verify-all
 
-# Pulihkan dari backup
-chantik restore <pola>
+# Restore from backup
+chantik restore <pattern>
 
-# Pulihkan dengan dry-run (tanpa perubahan)
-chantik restore --dry-run <pola>
+# Restore with dry-run (no changes)
+chantik restore --dry-run <pattern>
 
-# Pulihkan beberapa backup sekaligus
+# Restore multiple backups at once
 chantik restore volume_postgres volume_redis
 
-# Jalankan deduplikasi pada direktori backup
+# Run deduplication on the backup directory
 chantik dedup
 
-# Tampilkan bantuan
+# Show help
 chantik help
 ```
 
-### Contoh Perintah Restore
+### Restore Command Examples
 
 ```bash
-# Pulihkan semua backup yang cocok dengan 'postgres'
+# Restore all backups matching 'postgres'
 chantik restore postgres
 
-# Pulihkan backup dari tanggal tertentu
+# Restore backups from a specific date
 chantik restore 20260906
 
-# Pulihkan beberapa volume sekaligus
+# Restore multiple volumes at once
 chantik restore vol1 vol2 vol3
 
-# Pulihkan dengan pemisah koma
+# Restore with comma separator
 chantik restore "postgres,redis"
 
-# Dry-run restore (lihat apa yang akan dipulihkan)
+# Dry-run restore (see what would be restored)
 chantik restore --dry-run postgres
 ```
 
-### Konvensi Penamaan Backup
+### Backup Naming Convention
 
 ```
 chantik-backup_YYYYMMDD_HHMMSS/
-├── digital-independence_YYYYMMDD_HHMMSS_full.tar.gz.enc     # Backup penuh
-├── digital-independence_YYYYMMDD_HHMMSS_inc.tar.gz.enc      # Backup inkremental
-├── volume_postgres_data_YYYYMMDD_HHMMSS_full.tar.gz.enc     # Backup volume penuh
-├── volume_redis_cache_YYYYMMDD_HHMMSS_inc.tar.gz.enc        # Backup volume inkremental
-├── *.checksums                                              # Checksum SHA256
-└── *.enc.checksums                                          # Checksum file terenkripsi
+├── digital-independence_YYYYMMDD_HHMMSS_full.tar.gz.enc     # Full backup
+├── digital-independence_YYYYMMDD_HHMMSS_inc.tar.gz.enc      # Incremental backup
+├── volume_postgres_data_YYYYMMDD_HHMMSS_full.tar.gz.enc     # Full volume backup
+├── volume_redis_cache_YYYYMMDD_HHMMSS_inc.tar.gz.enc        # Incremental volume backup
+├── *.checksums                                              # SHA256 checksums
+└── *.enc.checksums                                          # Encrypted file checksums
 ```
 
-## 🔐 Keamanan
+## 🔐 Security
 
-### Detail Enkripsi
+### Encryption Details
 
-- Sandi utama adalah ChaCha20‑Poly1305 (enkripsi terotentikasi)
-- Sandi fallback adalah AES‑256‑CBC dengan derivasi kunci PBKDF2
-- Derivasi kunci menggunakan PBKDF2 dengan iterasi yang dapat dikonfigurasi (default 600.000)
-- Kekuatan kunci adalah enkripsi 256‑bit
-- Integritas dijamin oleh checksum SHA256 untuk verifikasi
-- Setiap backup diverifikasi terhadap kemungkinan perubahan
-- Dukungan nonce tetap untuk deduplikasi deterministik
+- Primary cipher is ChaCha20‑Poly1305 (authenticated encryption)
+- Fallback cipher is AES‑256‑CBC with PBKDF2 key derivation
+- Key derivation uses PBKDF2 with configurable iterations (default 600,000)
+- Key strength is 256‑bit encryption
+- Integrity is guaranteed by SHA256 checksums for verification
+- Every backup is verified against potential tampering
+- Fixed nonce support for deterministic deduplication
 
-### Praktik Terbaik Keamanan
+### Security Best Practices
 
-1. Jangan pernah melakukan komit konfigurasi ke kontrol versi
-2. Lindungi kunci enkripsi: `chmod 600 encryption.key`
-3. Simpan kunci enkripsi secara terpisah dari backup
-4. Gunakan token ntfy.sh yang kuat
-5. Rotasi kunci enkripsi secara teratur
-6. Uji pemulihan secara berkala
-7. Gunakan iterasi PBKDF2 yang tinggi (600.000+)
+1. Never commit configuration to version control
+2. Protect the encryption key: `chmod 600 encryption.key`
+3. Store the encryption key separately from backups
+4. Use a strong ntfy.sh token
+5. Rotate encryption keys regularly
+6. Test restores periodically
+7. Use high PBKDF2 iterations (600,000+)
 
-### Manajemen Kunci
+### Key Management
 
-Hasilkan kunci enkripsi baru:
+Generate a new encryption key:
 ```bash
 openssl rand -base64 32 > encryption.key
 chmod 600 encryption.key
 ```
 
-Hasilkan salt tetap untuk deduplikasi:
+Generate a fixed salt for deduplication:
 ```bash
 openssl rand -hex 8 > fixed_salt.txt
 chmod 600 fixed_salt.txt
 ```
 
-Cadangkan kunci enkripsi secara terpisah (GPG):
+Back up the encryption key separately (GPG):
 ```bash
 gpg -c encryption.key
 ```
 
-## 🔔 Notifikasi
+## 🔔 Notifications
 
-Chantik terintegrasi dengan [ntfy.sh](https://ntfy.sh/) untuk notifikasi real-time.
+Chantik integrates with [ntfy.sh](https://ntfy.sh/) for real-time notifications.
 
-### Menyiapkan Notifikasi
+### Setting Up Notifications
 
-1. Dapatkan token ntfy: Kunjungi https://ntfy.sh/account
-2. Pilih nama topik unik
-3. Konfigurasikan di `chantik.conf`:
+1. Get an ntfy token: Visit https://ntfy.sh/account
+2. Choose a unique topic name
+3. Configure in `chantik.conf`:
    ```bash
    NTFY_TOPIC="my-backup-topic"
    NTFY_TOKEN="tk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
    ```
 
-### Jenis Notifikasi
+### Notification Types
 
-| Jenis | Prioritas | Tag | Saat Dipicu |
+| Type | Priority | Tag | When Triggered |
 |------|----------|------|----------------|
-| Sukses | 3 (default) | ✅ | Backup berhasil diselesaikan |
-| Kesalahan | 5 (mendesak) | 🔴 | Backup gagal atau terputus |
-| Info | 3 | ℹ️ | Backup dimulai, konfigurasi dimuat |
-| Pemulihan | 3 | 🔄 | Operasi pemulihan selesai |
+| Success | 3 (default) | ✅ | Backup completed successfully |
+| Error | 5 (urgent) | 🔴 | Backup failed or interrupted |
+| Info | 3 | ℹ️ | Backup started, config loaded |
+| Restore | 3 | 🔄 | Restore operation completed |
 
-## 🗄️ Retensi & Rotasi
+## 🗄️ Retention & Rotation
 
-Chantik menggunakan kebijakan retensi cerdas:
+Chantik uses a smart retention policy:
 
-1. Backup harian: Simpan `RETENTION_DAILY` hari terakhir (default: 7)
-2. Backup mingguan: Simpan `RETENTION_WEEKLY` minggu terakhir (default: 4)
-3. Backup bulanan: Simpan `RETENTION_MONTHLY` bulan terakhir (default: 6)
+1. Daily backups: Keep the last `RETENTION_DAILY` days (default: 7)
+2. Weekly backups: Keep the last `RETENTION_WEEKLY` weeks (default: 4)
+3. Monthly backups: Keep the last `RETENTION_MONTHLY` months (default: 6)
 
-### Logika Retensi
+### Retention Logic
 
 ```bash
-# Contoh garis waktu retensi
-Retensi: Harian=7, Mingguan=4, Bulanan=6
+# Example retention timeline
+Retention: Daily=7, Weekly=4, Monthly=6
 
-# Backup yang dipertahankan:
-Hari 1-7:      Semua backup harian
-Minggu 1-4:    Satu backup per minggu
-Bulan 1-6:     Satu backup per bulan
-Lebih lama:    Dihapus
+# Backups retained:
+Day 1-7:      All daily backups
+Week 1-4:     One backup per week
+Month 1-6:    One backup per month
+Older:        Deleted
 ```
 
-## 🐳 Integrasi Container
+## 🐳 Container Integration
 
-Chantik dapat melakukan backup dan pemulihan volume Docker dan Podman:
+Chantik can back up and restore Docker and Podman volumes:
 
-### Backup Volume Container
+### Backing Up Container Volumes
 
 ```bash
-# Di chantik.conf - Gunakan Docker
+# In chantik.conf - Use Docker
 DOCKER_VOLUMES=(
     "postgres_data"
     "redis_cache"
@@ -422,49 +422,49 @@ DOCKER_VOLUMES=(
 )
 CONTAINER_RUNTIME="docker"
 
-# Atau gunakan Podman
+# Or use Podman
 PODMAN_VOLUMES=(
     "postgres_data"
     "redis_cache"
 )
 CONTAINER_RUNTIME="podman"
 
-# Atau biarkan auto-detect
+# Or let it auto-detect
 CONTAINER_RUNTIME="auto"
 
-# Setiap volume mendapatkan backup terenkripsi sendiri
+# Each volume gets its own encrypted backup
 volume_postgres_data_20260808_100000_full.tar.gz.enc
 volume_redis_cache_20260808_100000_inc.tar.gz.enc
 ```
 
-### Mendeteksi Runtime Secara Otomatis
+### Auto-Detecting the Runtime
 
-Chantik akan mendeteksi runtime container yang tersedia:
-1. Jika `CONTAINER_RUNTIME` diatur ke `docker` atau `podman`, gunakan itu
-2. Jika `auto`, periksa Podman terlebih dahulu, lalu Docker
-3. Jika tidak ada runtime ditemukan, akan muncul error
+Chantik will detect the available container runtime:
+1. If `CONTAINER_RUNTIME` is set to `docker` or `podman`, use that
+2. If `auto`, check Podman first, then Docker
+3. If no runtime is found, an error will appear
 
-### Memulihkan Volume Container
+### Restoring Container Volumes
 
 ```bash
-# Pulihkan volume (otomatis mendeteksi runtime)
+# Restore a volume (auto-detects runtime)
 chantik restore postgres_data
 
-# Pulihkan beberapa volume sekaligus
+# Restore multiple volumes at once
 chantik restore postgres_data redis_cache
 
-# Pulihkan dengan dry-run
+# Restore with dry-run
 chantik restore --dry-run postgres_data
 
-# Keluaran:
-[2026-08-08 10:30:00] 🦑 Memulihkan tipe: volume_postgres_data
-[2026-08-08 10:30:00] 🔐 Mendekripsi...
-[2026-08-08 10:30:05] ✅ Verifikasi checksum lulus.
-[2026-08-08 10:30:10] 📦 Memulihkan volume: postgres_data
-[2026-08-08 10:30:15] ✅ Pemulihan volume selesai untuk postgres_data
+# Output:
+[2026-08-08 10:30:00] 🦑 Restoring type: volume_postgres_data
+[2026-08-08 10:30:00] 🔐 Decrypting...
+[2026-08-08 10:30:05] ✅ Checksum verification passed.
+[2026-08-08 10:30:10] 📦 Restoring volume: postgres_data
+[2026-08-08 10:30:15] ✅ Volume restore complete for postgres_data
 ```
 
-## 🤖 Otomatisasi
+## 🤖 Automation
 
 ### Cron Job Examples
 
@@ -472,182 +472,182 @@ chantik restore --dry-run postgres_data
 # Edit crontab
 sudo crontab -e
 
-# Backup harian pada jam 2:00 AM
+# Daily backup at 2:00 AM
 0 2 * * * /usr/local/bin/chantik backup >> /var/log/chantik-cron.log 2>&1
 
-# Backup penuh mingguan pada hari Minggu jam 3:00 AM
+# Weekly full backup on Sunday at 3:00 AM
 0 3 * * 0 /usr/local/bin/chantik backup >> /var/log/chantik-cron.log 2>&1
 
-# Backup dengan pencatatan verbose
+# Backup with verbose logging
 0 2 * * * VERBOSE=true /usr/local/bin/chantik backup >> /var/log/chantik-cron.log 2>&1
 
-# Backup dengan konfigurasi kustom
+# Backup with custom configuration
 0 2 * * * CHANTIK_CONFIG=/etc/chantik/prod.conf /usr/local/bin/chantik backup
 ```
 
-### Contoh Jadwal
+### Schedule Examples
 
-| Jadwal | Ekspresi Cron | Deskripsi |
+| Schedule | Cron Expression | Description |
 |----------|----------------|-------------|
-| Harian | `0 2 * * *` | Setiap hari jam 2:00 AM |
-| Per Jam | `0 * * * *` | Setiap jam |
-| Mingguan | `0 3 * * 0` | Setiap hari Minggu jam 3:00 AM |
-| Bulanan | `0 4 1 * *` | Tanggal 1 setiap bulan jam 4:00 AM |
+| Daily | `0 2 * * *` | Every day at 2:00 AM |
+| Hourly | `0 * * * *` | Every hour |
+| Weekly | `0 3 * * 0` | Every Sunday at 3:00 AM |
+| Monthly | `0 4 1 * *` | 1st of every month at 4:00 AM |
 
-### Variabel Lingkungan
+### Environment Variables
 
 ```bash
-# Tentukan konfigurasi kustom
+# Specify a custom configuration
 CHANTIK_CONFIG=/path/to/chantik.conf
 
-# Tentukan direktori kerja
+# Specify the working directory
 CHANTIK_WORK_DIR=/path/to/workdir
 
-# Aktifkan verbose
+# Enable verbose
 VERBOSE=true
 
-# Gunakan dalam cron
+# Use in cron
 0 2 * * * CHANTIK_CONFIG=/etc/chantik/prod.conf VERBOSE=false /usr/local/bin/chantik backup
 ```
 
-## 🛠️ Pemecahan Masalah
+## 🛠️ Troubleshooting
 
-### Masalah Umum
+### Common Issues
 
-ChaCha20 tidak didukung:
+ChaCha20 not supported:
 ```bash
-⚠️ PERINGATAN: ChaCha20-Poly1305 tidak didukung; beralih ke AES-256-CBC.
+⚠️ WARNING: ChaCha20-Poly1305 not supported; falling back to AES-256-CBC.
 ```
-*Skrip akan secara otomatis menggunakan AES-256-CBC sebagai fallback.*
+*The script will automatically use AES-256-CBC as a fallback.*
 
-Ruang disk tidak mencukupi:
+Insufficient disk space:
 ```bash
-# Periksa ruang yang tersedia
+# Check available space
 df -h /media/backup
 
-# Kurangi retensi atau tingkatkan penyimpanan
+# Reduce retention or increase storage
 RETENTION_DAILY=3
 RETENTION_WEEKLY=2
 ```
 
-Kesalahan file kunci:
+Key file errors:
 ```bash
-# Jika backup sebelumnya terputus
+# If a previous backup was interrupted
 rm -f /path/to/chantik/.chantik.lock
-# Atau hapus direktori lock
+# Or remove the lock directory
 rm -rf /path/to/chantik/.chantik.lock.dir
 ```
 
-Runtime container tidak terdeteksi:
+Container runtime not detected:
 ```bash
-# Periksa Docker
+# Check Docker
 docker info
 
-# Periksa Podman
+# Check Podman
 podman info
 
-# Atur runtime secara eksplisit di konfigurasi
-CONTAINER_RUNTIME="docker"  # atau "podman"
+# Set the runtime explicitly in the config
+CONTAINER_RUNTIME="docker"  # or "podman"
 ```
 
-### Mode Debug
+### Debug Mode
 
-Aktifkan mode verbose:
+Enable verbose mode:
 ```bash
 VERBOSE=true chantik backup
 ```
 
-Periksa log:
+Check the log:
 ```bash
 tail -f chantik.log
-# atau jika log di lokasi kustom
+# or if the log is in a custom location
 tail -f /path/to/chantik.log
 ```
 
-Uji sistem enkripsi:
+Test the encryption system:
 ```bash
 chantik test
 ```
 
-## 📊 Optimasi Kinerja
+## 📊 Performance Optimization
 
-### Pengaturan yang Direkomendasikan
+### Recommended Settings
 
-| Skenario | GZIP_LEVEL | PBKDF2_ITERATIONS | INCREMENTAL_ENABLED |
+| Scenario | GZIP_LEVEL | PBKDF2_ITERATIONS | INCREMENTAL_ENABLED |
 |----------|------------|-------------------|-------------------|
-| Backup harian | 6 | 600000 | true |
-| File besar | 3 | 600000 | false |
-| Kompresi maksimum | 9 | 600000 | true |
-| Prioritas kecepatan | 1 | 100000 | false |
-| Prioritas keamanan | 6 | 1000000 | true |
+| Daily backup | 6 | 600000 | true |
+| Large files | 3 | 600000 | false |
+| Maximum compression | 9 | 600000 | true |
+| Speed priority | 1 | 100000 | false |
+| Security priority | 6 | 1000000 | true |
 
-### Optimasi Penyimpanan
+### Storage Optimization
 
-Gunakan deduplikasi dengan salt tetap:
+Use deduplication with a fixed salt:
 ```bash
 FIXED_SALT_FILE="/path/to/fixed_salt.txt"
 DEDUP_TOOL="hardlink"
 ```
 
-Gunakan backup inkremental:
+Use incremental backups:
 ```bash
 INCREMENTAL_ENABLED=true
 FULL_BACKUP_INTERVAL=14
 ```
 
-Kompresi lebih agresif:
+More aggressive compression:
 ```bash
 GZIP_LEVEL=9
 ```
 
-### Mendukung Banyak Runtime
+### Multi-Runtime Support
 
-Chantik mendeteksi dan menggunakan runtime yang tersedia:
-- **Podman**: Dideteksi pertama (jika tersedia)
-- **Docker**: Digunakan sebagai fallback
-- **Manual**: Atur `CONTAINER_RUNTIME` secara eksplisit
+Chantik detects and uses the available runtime:
+- **Podman**: Detected first (if available)
+- **Docker**: Used as a fallback
+- **Manual**: Set `CONTAINER_RUNTIME` explicitly
 
-## 🧪 Pengujian
+## 🧪 Testing
 
-Jalankan rangkaian uji lengkap:
+Run the full test suite:
 ```bash
 chantik test
 ```
 
-Rangkaian uji memverifikasi:
-- Enkripsi/dekripsi ChaCha20 (teks dan biner)
-- Fallback AES-256-CBC
-- Kompatibilitas PBKDF2
-- Deduplikasi nonce tetap (jika dikonfigurasi)
-- Deteksi runtime container
+The test suite verifies:
+- ChaCha20 encryption/decryption (text and binary)
+- AES-256-CBC fallback
+- PBKDF2 compatibility
+- Fixed nonce deduplication (if configured)
+- Container runtime detection
 
-## 🏗️ Struktur Direktori
+## 🏗️ Directory Structure
 
 ```
 chantik/
-├── chantik.sh              # Skrip utama
-├── chantik.conf            # Konfigurasi (buat dari example)
-├── chantik.conf.example    # Contoh konfigurasi
-├── encryption.key          # Kunci enkripsi (hasilkan sendiri)
-├── fixed_salt.txt          # Salt tetap (opsional)
-├── chantik.log             # File log
-├── .chantik.lock           # File lock (otomatis)
-├── .chantik.lock.dir/      # Direktori lock (otomatis)
-├── .tmp/                   # Direktori temporary
-└── .incremental/           # Data snapshot inkremental
+├── chantik.sh              # Main script
+├── chantik.conf            # Configuration (create from example)
+├── chantik.conf.example    # Example configuration
+├── encryption.key          # Encryption key (generate your own)
+├── fixed_salt.txt          # Fixed salt (optional)
+├── chantik.log             # Log file
+├── .chantik.lock           # Lock file (automatic)
+├── .chantik.lock.dir/      # Lock directory (automatic)
+├── .tmp/                   # Temporary directory
+└── .incremental/           # Incremental snapshot data
     ├── dir_digital-independence.snar
     ├── vol_postgres_data.snar
     └── vol_redis_cache.snar
 ```
 
-## 🙏 Ucapan Terima Kasih
+## 🙏 Acknowledgements
 
-- ChaCha20-Poly1305 - Enkripsi terotentikasi
-- OpenSSL - Operasi kriptografi
-- ntfy.sh - Layanan notifikasi
-- Docker & Podman - Backup volume container
-- Alpine Linux - Image container ringan
+- ChaCha20-Poly1305 - Authenticated encryption
+- OpenSSL - Cryptographic operations
+- ntfy.sh - Notification service
+- Docker & Podman - Container volume backups
+- Alpine Linux - Lightweight container image
 
-## 📄 Lisensi
+## 📄 License
 
-Lisensi MIT - Lihat file [LICENSE](LICENSE) untuk detailnya.
+MIT License - See the [LICENSE](LICENSE) file for details.
